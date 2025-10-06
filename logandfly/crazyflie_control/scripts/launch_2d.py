@@ -30,5 +30,4 @@ def main_2d():
 
 if __name__ == '__main__':
     print("Launching Crazyflie with 2D Visualization...")
-    print("Perfect for debugging autonomous navigation!")
     sys.exit(main_2d())

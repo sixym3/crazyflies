@@ -7,6 +7,7 @@ Handles obstacle detection, path planning, and navigation commands.
 
 import math
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -34,7 +35,7 @@ class AsyncPathPlanner:
     def __init__(self):
         self.current_path = deque()
         self.planning_lock = threading.Lock()
-        self.should_plan = threading.Event()
+        self.needs_planning = False  # Flag to trigger planning (protected by lock)
         self.stop_planning = threading.Event()
         self.planning_thread = None
         self.grid = None
@@ -59,7 +60,7 @@ class AsyncPathPlanner:
         with self.planning_lock:
             self.grid = grid
             self.target_pos = target_pos
-            self.should_plan.set()
+            self.needs_planning = True
 
     def get_current_path(self):
         """Get the current planned path (thread-safe)."""
@@ -82,9 +83,14 @@ class AsyncPathPlanner:
     def _planning_worker(self):
         """Background worker for path planning."""
         while not self.stop_planning.is_set():
-            if self.should_plan.wait(timeout=0.1):
-                self.should_plan.clear()
+            # Poll for planning requests every 100ms
+            should_plan = False
+            with self.planning_lock:
+                if self.needs_planning:
+                    should_plan = True
+                    self.needs_planning = False
 
+            if should_plan:
                 if pyastar2d is None:
                     continue
 
@@ -136,6 +142,9 @@ class AsyncPathPlanner:
                         except Exception as e:
                             print(f"Path planning error: {e}")
                             self.current_path.clear()
+            else:
+                # Sleep when no planning needed
+                time.sleep(0.1)
 
 
 class AutonomousNavigator:
@@ -177,8 +186,14 @@ class AutonomousNavigator:
             current_x, current_y, current_z = self.last_drone_position
             self.target_world_position = (current_x + TARGET_DISTANCE, current_y, current_z)
             print(f"Autonomous mode: ENABLED - Target set to {self.target_world_position}")
+            print(f"DEBUG: Current drone position: {self.last_drone_position}")
 
             self.path_planner.start()
+
+            # Immediately request first path with current grid state
+            # This ensures path planning starts right away instead of waiting for next sensor update
+            self._do_autonomous_planning()
+            print("DEBUG: Initial path request sent")
         else:
             self.path_planner.stop()
             self.current_waypoint = None
@@ -266,12 +281,16 @@ class AutonomousNavigator:
     def _do_autonomous_planning(self):
         """Perform autonomous path planning."""
         if self.target_world_position is None:
+            print("DEBUG: Planning skipped - no target set")
             return
 
         # Convert fixed world target to grid coordinates
         target_x, target_y = self.target_world_position[0], self.target_world_position[1]
         drone_x, drone_y = self.last_drone_position[0], self.last_drone_position[1]
         target_grid_pos = self.occupancy_grid.world_to_grid(target_x, target_y, drone_x, drone_y)
+
+        grid_stats = self.occupancy_grid.get_grid_stats()
+        print(f"DEBUG: Requesting path - Drone: ({drone_x:.2f}, {drone_y:.2f}) -> Target: ({target_x:.2f}, {target_y:.2f}), Grid target: {target_grid_pos}, Obstacles: {grid_stats['obstacles']}")
 
         self.path_planner.request_path(self.occupancy_grid, target_grid_pos)
 
@@ -295,7 +314,8 @@ class AutonomousNavigator:
 
         # Check if we need to get a new waypoint or refresh periodically
         if self.current_waypoint is None or should_refresh_path:
-            if self.path_planner.has_waypoints():
+            has_waypoints = self.path_planner.has_waypoints()
+            if has_waypoints:
                 # Get the first waypoint from the path
                 path = self.path_planner.get_current_path()
                 if path:
@@ -303,10 +323,15 @@ class AutonomousNavigator:
                     new_waypoint = path[0]
                     if self.current_waypoint is None or self.current_waypoint != new_waypoint:
                         self.current_waypoint = new_waypoint
+                        print(f"DEBUG: New waypoint set to {self.current_waypoint}")
                         if should_refresh_path:
                             print(f"Path refreshed: new waypoint {self.current_waypoint}")
+            elif self.path_check_counter % 20 == 0:  # Log every 2 seconds
+                print(f"DEBUG: No waypoints available in path")
 
         if self.current_waypoint is None:
+            if self.path_check_counter % 20 == 0:  # Log every 2 seconds
+                print("DEBUG: No current waypoint - returning zero command")
             return {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
 
         # Convert waypoint from grid coordinates to world coordinates
@@ -346,6 +371,9 @@ class AutonomousNavigator:
                 cmd_x = max_speed if cmd_x > 0 else -max_speed
             if abs(cmd_y) > max_speed:
                 cmd_y = max_speed if cmd_y > 0 else -max_speed
+
+            if self.path_check_counter % 20 == 0:  # Log every 2 seconds
+                print(f"DEBUG: Command - waypoint: {waypoint_world}, dist: {distance:.2f}m, cmd: ({cmd_x:.2f}, {cmd_y:.2f})")
 
             return {'x': cmd_x, 'y': cmd_y, 'yaw': 0.0}
         else:
