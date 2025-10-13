@@ -28,6 +28,8 @@ setup(
             'autonomous_navigation_node = crazyflie_ros2.autonomous_navigation_node:main',
             'crazyflie_sim_node = crazyflie_ros2.crazyflie_sim_node:main',
             'crazyflie_sim_with_simple_mapper = crazyflie_ros2.crazyflie_sim_with_simple_mapper:main',
+            'rviz_goal_click_bridge = crazyflie_ros2.rviz_goal_click_bridge:main',
+            'range_monitor_node = crazyflie_ros2.range_monitor_node:main',
         ],
     },
 )

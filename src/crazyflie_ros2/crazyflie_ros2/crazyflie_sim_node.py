@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-ROS2 Crazyflie Simulation Node
+ROS2 Crazyflie Simulation Node (updated to mirror crazyflie_node.py TF chain)
 
-Simulates a Crazyflie in a 5m x 5m x 2m box centered at the origin.
-- Takes off to 0.30 m, then slowly rotates in yaw.
-- Listens to /cmd_vel (Twist: vx, vy, vz, yaw_rate) in body frame.
-- Publishes the same topics that crazyflie_node.py publishes:
-    /crazyflie/pose (PoseStamped)
-    /crazyflie/odom (Odometry)
-    /crazyflie/scan (LaserScan)  # [back, right, front, left]
-    /crazyflie/range/{front,back,left,right,up,down} (Range)
-- Broadcasts TF world -> <frame_id>
+- Static TFs:  map -> world (identity), world -> odom (identity)
+- Dynamic TF:  odom -> base (robot pose)
+- Topic frames:
+    /crazyflie/pose    : frame_id = <world_frame>
+    /crazyflie/odom    : header.frame_id = <odom_frame>, child_frame_id = <base_frame>
+    /crazyflie/scan    : frame_id = <base_frame>
+    /crazyflie/range/* : frame_id = <base_frame>/{front,back,left,right,up,down}
+
+Also keeps back-compat for users who only set 'frame_id': if 'base_frame' is default and
+'frame_id' is changed, we keep them in sync (same behavior as crazyflie_node.py).
 """
 
 import math
@@ -48,21 +49,13 @@ class CrazyflieSimNode(Node):
         self.declare_parameter('box_half_xy', 2.5)
         self.declare_parameter('box_height', 2.0)
 
-
+        # Explicit TF frames (mirror real node)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('world_frame', 'world')
         self.declare_parameter('odom_frame', 'crazyflie/odom')
         self.declare_parameter('base_frame', 'crazyflie')
 
-        self.map_frame   = self.get_parameter('map_frame').value
-        self.world_frame = self.get_parameter('world_frame').value
-        self.odom_frame  = self.get_parameter('odom_frame').value
-        self.base_frame  = self.get_parameter('base_frame').value
-
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_broadcaster = StaticTransformBroadcaster(self)
-        self._publish_static_identities()
-
+        # Read parameters
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.publish_rate_hz = float(self.get_parameter('publish_rate_hz').value)
         self.takeoff_height = float(self.get_parameter('takeoff_height').value)
@@ -73,6 +66,15 @@ class CrazyflieSimNode(Node):
             half_xy=float(self.get_parameter('box_half_xy').value),
             height=float(self.get_parameter('box_height').value),
         )
+
+        self.map_frame   = self.get_parameter('map_frame').value
+        self.world_frame = self.get_parameter('world_frame').value
+        self.odom_frame  = self.get_parameter('odom_frame').value
+        self.base_frame  = self.get_parameter('base_frame').value
+
+        # Back-compat: if user changed frame_id but not base_frame, keep them in sync
+        if self.base_frame == 'crazyflie' and self.frame_id != 'crazyflie':
+            self.base_frame = self.frame_id
 
         # QoS (match sensor streams style from real node)
         sensor_qos = QoSProfile(
@@ -88,14 +90,17 @@ class CrazyflieSimNode(Node):
 
         self.range_pubs = {
             'front': self.create_publisher(Range, '/crazyflie/range/front', sensor_qos),
-            'back':  self.create_publisher(Range, '/crazyflie/range/back', sensor_qos),
-            'left':  self.create_publisher(Range, '/crazyflie/range/left', sensor_qos),
+            'back':  self.create_publisher(Range, '/crazyflie/range/back',  sensor_qos),
+            'left':  self.create_publisher(Range, '/crazyflie/range/left',  sensor_qos),
             'right': self.create_publisher(Range, '/crazyflie/range/right', sensor_qos),
-            'up':    self.create_publisher(Range, '/crazyflie/range/up', sensor_qos),
-            'down':  self.create_publisher(Range, '/crazyflie/range/down', sensor_qos),
+            'up':    self.create_publisher(Range, '/crazyflie/range/up',    sensor_qos),
+            'down':  self.create_publisher(Range, '/crazyflie/range/down',  sensor_qos),
         }
 
+        # ----- TF broadcasters -----
         self.tf_broadcaster = TransformBroadcaster(self)
+        self.static_broadcaster = StaticTransformBroadcaster(self)
+        self._publish_static_identities()
 
         # ----- Subscriber -----
         self.cmd_lock = threading.Lock()
@@ -124,11 +129,13 @@ class CrazyflieSimNode(Node):
             f"takeoff={self.takeoff_height:.2f} m, rate={self.publish_rate_hz:.1f} Hz"
         )
 
-    # -------------------- Callbacks --------------------
+    # -------------------- TF setup --------------------
     def _publish_static_identities(self):
+        now = self.get_clock().now().to_msg()
+
         # map -> world (identity)
         t_m_w = TransformStamped()
-        t_m_w.header.stamp = self.get_clock().now().to_msg()
+        t_m_w.header.stamp = now
         t_m_w.header.frame_id = self.map_frame
         t_m_w.child_frame_id = self.world_frame
         t_m_w.transform.rotation.w = 1.0
@@ -136,12 +143,13 @@ class CrazyflieSimNode(Node):
 
         # world -> odom (identity)
         t_w_o = TransformStamped()
-        t_w_o.header.stamp = t_m_w.header.stamp
+        t_w_o.header.stamp = now
         t_w_o.header.frame_id = self.world_frame
         t_w_o.child_frame_id = self.odom_frame
         t_w_o.transform.rotation.w = 1.0
         self.static_broadcaster.sendTransform(t_w_o)
 
+    # -------------------- Callbacks --------------------
     def _cmd_vel_cb(self, msg: Twist):
         with self.cmd_lock:
             # Clamp for sanity
@@ -153,7 +161,6 @@ class CrazyflieSimNode(Node):
             self.last_cmd_time = self.get_clock().now()
 
     # -------------------- Simulation core --------------------
-
     def _update_and_publish(self):
         now = self.get_clock().now()
         dt = self.dt
@@ -178,15 +185,14 @@ class CrazyflieSimNode(Node):
             vx_b = cmd.linear.x
             vy_b = cmd.linear.y
             vz = cmd.linear.z
-            # Mimic “hover_height adjust” semantics from your real node: small increments
+            # Mimic hardware node's gentle target height adjustment semantics
             if abs(cmd.linear.z) < 1e-6:
                 # no vertical command: hold target
                 vz = 1.0 * (self._target_z - self.z)
             else:
-                # gently adjust the hold height to feel similar to hardware node behavior
                 self._target_z = float(min(self.box.height - 0.05, max(0.05, self._target_z + cmd.linear.z * 0.01)))
 
-        # Body -> world transform for velocities
+        # Body -> world transform for velocities (using current yaw)
         c = math.cos(self.yaw)
         s = math.sin(self.yaw)
         vx_w = c * vx_b - s * vy_b
@@ -198,7 +204,7 @@ class CrazyflieSimNode(Node):
         self.z += vz * dt
         self.yaw += yaw_rate * dt
 
-        # Constrain inside the box (simple collision: stop at wall)
+        # Constrain inside the box
         self._constrain_inside_box()
 
         # Publish data
@@ -215,9 +221,8 @@ class CrazyflieSimNode(Node):
         self.z = min(self.box.height - 0.001, max(0.001, self.z))
 
     # -------------------- Publishing helpers --------------------
-
     def _publish_pose_odom_tf(self, stamp):
-        # PoseStamped (choose world or odom; world shown here)
+        # PoseStamped in world frame (for visualization; consistent with real node)
         pose = PoseStamped()
         pose.header.stamp = stamp
         pose.header.frame_id = self.world_frame
@@ -243,7 +248,6 @@ class CrazyflieSimNode(Node):
         odom.pose.pose = pose.pose
         self.odom_pub.publish(odom)
 
-
     def _publish_ranges_and_scan(self, stamp):
         # Distances along body axes to walls (2D ray to axis-aligned square)
         front = self._ray_to_box_distance_2d(dir_bx=1.0, dir_by=0.0)   # +X body
@@ -253,13 +257,13 @@ class CrazyflieSimNode(Node):
         up    = max(0.0, self.box.height - self.z)
         down  = max(0.0, self.z - 0.0)
 
-        # Publish Range messages (IR-like)
+        # Publish Range messages (IR-like) — use base_frame/* for sensor frames
         for name, dist in [
             ('front', front), ('back', back), ('left', left), ('right', right),
             ('up', up), ('down', down),
         ]:
             r = Range()
-            r.header = Header(stamp=stamp, frame_id=f'{self.frame_id}/{name}')
+            r.header = Header(stamp=stamp, frame_id=f'{self.base_frame}/{name}')
             r.radiation_type = Range.INFRARED
             r.field_of_view = 0.436  # ~25 deg
             r.min_range = 0.01
@@ -267,9 +271,9 @@ class CrazyflieSimNode(Node):
             r.range = float('inf') if dist > r.max_range else float(max(r.min_range, dist))
             self.range_pubs[name].publish(r)
 
-        # LaserScan: order [back, right, front, left] to match your node’s convention
+        # LaserScan: order [back, right, front, left]; frame_id = base_frame
         scan = LaserScan()
-        scan.header = Header(stamp=stamp, frame_id=self.frame_id)
+        scan.header = Header(stamp=stamp, frame_id=self.base_frame)
         scan.range_min = 0.01
         scan.range_max = self._max_range
 
@@ -283,7 +287,6 @@ class CrazyflieSimNode(Node):
         self.scan_pub.publish(scan)
 
     # -------------------- Geometry helpers --------------------
-
     def _ray_to_box_distance_2d(self, dir_bx: float, dir_by: float) -> float:
         """Distance from current (x,y,yaw) along BODY axis to square walls in world.
         Uses 2D ray intersection with vertical/horizontal lines x = ±half_xy, y = ±half_xy.
@@ -317,11 +320,9 @@ class CrazyflieSimNode(Node):
 
         # Use smallest positive intersection distance
         t_min = min(t_candidates)
-        # distance in world equals t since direction is unit length (dx,dy) may not be unit; normalize
-        norm = math.hypot(dx, dy)
-        if norm < 1e-9:
-            return float('inf')
-        return t_min * 1.0  # since param t defined directly in world units with non-normalized dx/dy
+        # distance scaling — since we used non-normalized dx/dy, but t was computed in world units
+        # the param t already represents world distance along that direction
+        return t_min
 
     @staticmethod
     def _quat_from_rpy(roll, pitch, yaw):
@@ -331,7 +332,7 @@ class CrazyflieSimNode(Node):
         qw = cr * cp * cy + sr * sp * sy
         qx = sr * cp * cy - cr * sp * sy
         qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
+        qz = cr * cp * sy - sr * cp * cy
         return qx, qy, qz, qw
 
 
