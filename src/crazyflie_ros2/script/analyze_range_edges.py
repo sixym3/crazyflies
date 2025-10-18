@@ -21,6 +21,7 @@ from typing import Optional
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def compute_rolling_zscore(
@@ -51,6 +52,14 @@ def make_axes_data(df: pd.DataFrame, use_time: bool, time_col: str, x_label: str
 
 
 def plot_series_with_edges(x, y, edges_mask, title, ylabel, save_path: Optional[str] = None, show: bool = False):
+    # Convert to numpy arrays to avoid pandas Index multidimensional indexing issues
+    x = np.asarray(x)
+    y = np.asarray(y)
+    edges_mask = np.asarray(edges_mask, dtype=bool).ravel()
+    # Safety: ensure same length
+    n = min(len(x), len(y), len(edges_mask))
+    x, y, edges_mask = x[:n], y[:n], edges_mask[:n]
+
     # Single figure for the series
     fig = plt.figure(figsize=(10, 4.5))
     ax = fig.add_subplot(111)
@@ -71,6 +80,8 @@ def plot_series_with_edges(x, y, edges_mask, title, ylabel, save_path: Optional[
 
 
 def plot_zscore(x, z, z_thresh, title, save_path: Optional[str] = None, show: bool = False):
+    x = np.asarray(x)
+    z = np.asarray(z)
     fig = plt.figure(figsize=(10, 4.5))
     ax = fig.add_subplot(111)
     ax.plot(x, z, linewidth=1.5)

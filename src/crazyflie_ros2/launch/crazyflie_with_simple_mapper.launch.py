@@ -71,6 +71,15 @@ def generate_launch_description():
         arguments=['--ros-args', '--log-level', ['simple_mapper_node:=', LaunchConfiguration('log_level')]],
         parameters=[{
             'robot_prefix': LaunchConfiguration('robot_prefix'),
+            'use_bayesian_updates': True,  # Enable Bayesian occupancy updates
+            'avoidance_distance': 0.5,     # meters
+            'max_avoidance_weight': 50,    # 1-50 range
+            # Map configuration (Option B: extends in +X direction)
+            'map_size_x': 40.0,           # meters (40m x 20m map)
+            'map_size_y': 20.0,           # meters
+            'map_origin_x': -10.0,        # X range: -10 to +30m
+            'map_origin_y': -10.0,        # Y range: -10 to +10m
+            'map_resolution': 0.1,        # meters per cell
         }]
     )
 

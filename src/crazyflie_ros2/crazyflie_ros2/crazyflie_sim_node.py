@@ -31,8 +31,27 @@ from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 
 @dataclass
 class BoxDims:
-    half_xy: float = 2.5  # box extends from -2.5..+2.5 in x and y (5m square)
-    height: float = 2.0   # ceiling z = 2.0 m
+    half_xy: float = 3.75  # box extends from -3.75..+3.75 in x and y (7.5m square)
+    height: float = 2.0    # ceiling z = 2.0 m
+
+
+@dataclass
+class ObstaclePlatform:
+    """Raised platform obstacle in the environment."""
+    x_min: float = 0.85    # Platform at positive x, positive y
+    x_max: float = 1.15    # 0.3m wide
+    y_min: float = 0.85
+    y_max: float = 1.15    # 0.3m deep
+    height: float = 0.3    # 0.3m tall platform
+
+
+@dataclass
+class ObstacleCylinder:
+    """Cylindrical obstacle in the environment."""
+    center_x: float = -1.875  # Halfway between center (0,0) and corner (-3.75, -3.75)
+    center_y: float = -1.875
+    radius: float = 0.25      # 0.25m radius
+    height: float = 0.3       # 0.3m tall cylinder
 
 
 class CrazyflieSimNode(Node):
@@ -46,8 +65,9 @@ class CrazyflieSimNode(Node):
         self.declare_parameter('default_yaw_rate', 0.3)  # rad/s slow spin when idle
         self.declare_parameter('speed_limit', 1.0)       # m/s clamp
         self.declare_parameter('yaw_rate_limit', 2.0)    # rad/s clamp
-        self.declare_parameter('box_half_xy', 2.5)
+        self.declare_parameter('box_half_xy', 3.75)      # increased by 50%
         self.declare_parameter('box_height', 2.0)
+        self.declare_parameter('responsiveness', 0.3)    # velocity response lag (0-1, lower = more lag)
 
         # Explicit TF frames (mirror real node)
         self.declare_parameter('map_frame', 'map')
@@ -62,10 +82,13 @@ class CrazyflieSimNode(Node):
         self.default_yaw_rate = float(self.get_parameter('default_yaw_rate').value)
         self.speed_limit = float(self.get_parameter('speed_limit').value)
         self.yaw_rate_limit = float(self.get_parameter('yaw_rate_limit').value)
+        self.responsiveness = float(self.get_parameter('responsiveness').value)
         self.box = BoxDims(
             half_xy=float(self.get_parameter('box_half_xy').value),
             height=float(self.get_parameter('box_height').value),
         )
+        self.obstacle = ObstaclePlatform()  # Fixed 0.3x0.3m platform
+        self.cylinder = ObstacleCylinder()  # Fixed cylinder with radius 0.25m
 
         self.map_frame   = self.get_parameter('map_frame').value
         self.world_frame = self.get_parameter('world_frame').value
@@ -117,6 +140,12 @@ class CrazyflieSimNode(Node):
         self.yaw = 0.0
         self._max_range = 3.49  # to mirror mapper expectation
 
+        # Current velocities (for lag/inertia simulation)
+        self.vx_current = 0.0
+        self.vy_current = 0.0
+        self.vz_current = 0.0
+        self.yaw_rate_current = 0.0
+
         # Takeoff target
         self._target_z = self.takeoff_height
 
@@ -126,7 +155,15 @@ class CrazyflieSimNode(Node):
 
         self.get_logger().info(
             f"CrazyflieSimNode started: box=({self.box.half_xy*2:.1f}m x {self.box.half_xy*2:.1f}m x {self.box.height:.1f}m), "
-            f"takeoff={self.takeoff_height:.2f} m, rate={self.publish_rate_hz:.1f} Hz"
+            f"takeoff={self.takeoff_height:.2f} m, rate={self.publish_rate_hz:.1f} Hz, responsiveness={self.responsiveness:.2f}"
+        )
+        self.get_logger().info(
+            f"Obstacle platform at ({self.obstacle.x_min:.2f}-{self.obstacle.x_max:.2f}, "
+            f"{self.obstacle.y_min:.2f}-{self.obstacle.y_max:.2f}), height={self.obstacle.height:.2f}m"
+        )
+        self.get_logger().info(
+            f"Obstacle cylinder at ({self.cylinder.center_x:.2f}, {self.cylinder.center_y:.2f}), "
+            f"radius={self.cylinder.radius:.2f}m, height={self.cylinder.height:.2f}m"
         )
 
     # -------------------- TF setup --------------------
@@ -173,36 +210,43 @@ class CrazyflieSimNode(Node):
         time_since_cmd = (now - self.last_cmd_time).nanoseconds * 1e-9
         idle = time_since_cmd > 0.5  # 0.5 s without command => idle
 
-        vx_b = 0.0
-        vy_b = 0.0
-        vz = 0.0
-        yaw_rate = self.default_yaw_rate if idle else cmd.angular.z
+        vx_b_target = 0.0
+        vy_b_target = 0.0
+        vz_target = 0.0
+        yaw_rate_target = self.default_yaw_rate if idle else cmd.angular.z
 
         if idle:
             # Passive altitude hold toward target_z
-            vz = 1.0 * (self._target_z - self.z)  # simple P term, capped below
+            vz_target = 1.0 * (self._target_z - self.z)  # simple P term
         else:
-            vx_b = cmd.linear.x
-            vy_b = cmd.linear.y
-            vz = cmd.linear.z
+            vx_b_target = cmd.linear.x
+            vy_b_target = cmd.linear.y
+            vz_target = cmd.linear.z
             # Mimic hardware node's gentle target height adjustment semantics
             if abs(cmd.linear.z) < 1e-6:
                 # no vertical command: hold target
-                vz = 1.0 * (self._target_z - self.z)
+                vz_target = 1.0 * (self._target_z - self.z)
             else:
                 self._target_z = float(min(self.box.height - 0.05, max(0.05, self._target_z + cmd.linear.z * 0.01)))
+
+        # Apply velocity lag/inertia (exponential smoothing to simulate real drone response)
+        alpha = self.responsiveness  # 0.3 means slower response
+        self.vx_current = alpha * vx_b_target + (1 - alpha) * self.vx_current
+        self.vy_current = alpha * vy_b_target + (1 - alpha) * self.vy_current
+        self.vz_current = alpha * vz_target + (1 - alpha) * self.vz_current
+        self.yaw_rate_current = alpha * yaw_rate_target + (1 - alpha) * self.yaw_rate_current
 
         # Body -> world transform for velocities (using current yaw)
         c = math.cos(self.yaw)
         s = math.sin(self.yaw)
-        vx_w = c * vx_b - s * vy_b
-        vy_w = s * vx_b + c * vy_b
+        vx_w = c * self.vx_current - s * self.vy_current
+        vy_w = s * self.vx_current + c * self.vy_current
 
         # Integrate
         self.x += vx_w * dt
         self.y += vy_w * dt
-        self.z += vz * dt
-        self.yaw += yaw_rate * dt
+        self.z += self.vz_current * dt
+        self.yaw += self.yaw_rate_current * dt
 
         # Constrain inside the box
         self._constrain_inside_box()
@@ -255,7 +299,7 @@ class CrazyflieSimNode(Node):
         left  = self._ray_to_box_distance_2d(dir_bx=0.0, dir_by=1.0)   # +Y body
         right = self._ray_to_box_distance_2d(dir_bx=0.0, dir_by=-1.0)  # -Y body
         up    = max(0.0, self.box.height - self.z)
-        down  = max(0.0, self.z - 0.0)
+        down  = self._compute_range_down()
 
         # Publish Range messages (IR-like) — use base_frame/* for sensor frames
         for name, dist in [
@@ -287,18 +331,78 @@ class CrazyflieSimNode(Node):
         self.scan_pub.publish(scan)
 
     # -------------------- Geometry helpers --------------------
+    def _compute_range_down(self) -> float:
+        """
+        Compute downward range distance accounting for obstacles (platform and cylinder).
+        When drone is over an obstacle, measures to top of that obstacle.
+        When crossing edge, creates spike in reading (floor drop).
+        """
+        # Check if drone is over the rectangular platform
+        if (self.obstacle.x_min <= self.x <= self.obstacle.x_max and
+            self.obstacle.y_min <= self.y <= self.obstacle.y_max):
+            # Over the platform - measure to top of platform
+            distance = max(0.0, self.z - self.obstacle.height)
+        # Check if drone is over the cylindrical obstacle
+        elif math.hypot(self.x - self.cylinder.center_x, self.y - self.cylinder.center_y) <= self.cylinder.radius:
+            # Over the cylinder - measure to top of cylinder
+            distance = max(0.0, self.z - self.cylinder.height)
+        else:
+            # Not over any obstacle - measure to floor
+            distance = max(0.0, self.z - 0.0)
+
+        return distance
+
+    def _ray_to_cylinder_distance_2d(self, dx: float, dy: float) -> float:
+        """
+        Calculate distance from current position to cylinder along direction (dx, dy).
+        Returns inf if no intersection.
+        """
+        # Ray-circle intersection in 2D
+        # Ray: P(t) = (self.x, self.y) + t*(dx, dy)
+        # Circle: (x - cx)^2 + (y - cy)^2 = r^2
+
+        # Vector from circle center to ray origin
+        fx = self.x - self.cylinder.center_x
+        fy = self.y - self.cylinder.center_y
+
+        # Quadratic coefficients: a*t^2 + b*t + c = 0
+        a = dx*dx + dy*dy
+        if a < 1e-9:  # Ray has no direction
+            return float('inf')
+
+        b = 2.0 * (fx*dx + fy*dy)
+        c = fx*fx + fy*fy - self.cylinder.radius*self.cylinder.radius
+
+        discriminant = b*b - 4*a*c
+
+        if discriminant < 0:  # No intersection
+            return float('inf')
+
+        # Two intersection points
+        sqrt_disc = math.sqrt(discriminant)
+        t1 = (-b - sqrt_disc) / (2*a)
+        t2 = (-b + sqrt_disc) / (2*a)
+
+        # We want the smallest positive t (closest intersection in ray direction)
+        if t1 > 0:
+            return t1
+        elif t2 > 0:
+            return t2
+        else:
+            return float('inf')  # Both intersections behind us
+
     def _ray_to_box_distance_2d(self, dir_bx: float, dir_by: float) -> float:
-        """Distance from current (x,y,yaw) along BODY axis to square walls in world.
-        Uses 2D ray intersection with vertical/horizontal lines x = ±half_xy, y = ±half_xy.
+        """
+        Distance from current (x,y,yaw) along BODY axis to nearest obstacle in world.
+        Checks both box walls and cylindrical obstacle, returns minimum distance.
         """
         # Rotate body direction into world
         c = math.cos(self.yaw); s = math.sin(self.yaw)
         dx = c * dir_bx - s * dir_by
         dy = s * dir_bx + c * dir_by
 
-        # Avoid division by zero: if ray is parallel, skip that plane
+        # Check box walls
         t_candidates = []
-
         hx = self.box.half_xy
 
         if abs(dx) > 1e-9:
@@ -315,14 +419,13 @@ class CrazyflieSimNode(Node):
             t = (-hx - self.y) / dy
             if t > 0: t_candidates.append(t)
 
-        if not t_candidates:
-            return float('inf')
+        wall_dist = min(t_candidates) if t_candidates else float('inf')
 
-        # Use smallest positive intersection distance
-        t_min = min(t_candidates)
-        # distance scaling — since we used non-normalized dx/dy, but t was computed in world units
-        # the param t already represents world distance along that direction
-        return t_min
+        # Check cylinder obstacle
+        cylinder_dist = self._ray_to_cylinder_distance_2d(dx, dy)
+
+        # Return the closer of the two
+        return min(wall_dist, cylinder_dist)
 
     @staticmethod
     def _quat_from_rpy(roll, pitch, yaw):

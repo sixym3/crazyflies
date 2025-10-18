@@ -22,16 +22,39 @@ import math
 import numpy as np
 from bresenham import bresenham
 
-GLOBAL_SIZE_X = 20.0
-GLOBAL_SIZE_Y = 20.0
-MAP_RES = 0.1
-
-
 class SimpleMapperMultiranger(Node):
     def __init__(self):
         super().__init__('simple_mapper_multiranger')
+
+        # Declare parameters
         self.declare_parameter('robot_prefix', '/crazyflie')
+        self.declare_parameter('avoidance_distance', 0.5)  # meters
+        self.declare_parameter('max_avoidance_weight', 50)  # 1-50 range for weights
+
+        # Bayesian occupancy grid parameters
+        # Default OFF for simple ray logic (no Bayesian probabilities)
+        self.declare_parameter('use_bayesian_updates', False)
+        self.use_bayesian_updates = self.get_parameter('use_bayesian_updates').value
+
+        # Map size and origin parameters (Option B: extends in +X direction)
+        self.declare_parameter('map_size_x', 40.0)  # meters (default 40m, was 20m)
+        self.declare_parameter('map_size_y', 20.0)  # meters
+        self.declare_parameter('map_origin_x', -10.0)  # meters (X range: -10 to +30)
+        self.declare_parameter('map_origin_y', -10.0)  # meters (Y range: -10 to +10)
+        self.declare_parameter('map_resolution', 0.1)  # meters per cell
+
+        # Get parameter values
         robot_prefix = self.get_parameter('robot_prefix').value
+        self.avoidance_distance = self.get_parameter('avoidance_distance').value
+        self.max_avoidance_weight = self.get_parameter('max_avoidance_weight').value
+        self.use_bayesian_updates = self.get_parameter('use_bayesian_updates').value
+
+        # Map configuration
+        self.map_size_x = self.get_parameter('map_size_x').value
+        self.map_size_y = self.get_parameter('map_size_y').value
+        self.map_origin_x = self.get_parameter('map_origin_x').value
+        self.map_origin_y = self.get_parameter('map_origin_y').value
+        self.map_resolution = self.get_parameter('map_resolution').value
 
         self.odom_subscriber = self.create_subscription(
             Odometry, robot_prefix + '/odom', self.odom_subscribe_callback, 10)
@@ -54,13 +77,36 @@ class SimpleMapperMultiranger(Node):
 
         self.position_update = False
 
-        self.map = [-1] * int(GLOBAL_SIZE_X / MAP_RES) * \
-            int(GLOBAL_SIZE_Y / MAP_RES)
+        # Calculate map dimensions
+        self.map_width = int(self.map_size_x / self.map_resolution)
+        self.map_height = int(self.map_size_y / self.map_resolution)
+        map_size = self.map_width * self.map_height
+
+        # Initialize occupancy grid (-1 = unknown)
+        self.map = [-1] * map_size
+
+        # Initialize log-odds grid for Bayesian updates (0 = 50% probability)
+        # Log-odds = log(p / (1-p)), where p is probability of occupancy
+        self.log_odds = np.zeros(map_size, dtype=np.float32)
+
+        # Bayesian update probabilities
+        self.p_occupied_given_detection = 0.9  # 90% confidence when obstacle detected
+        self.p_free_given_clear = 0.7  # 70% confidence when ray passes through
+        self.log_odds_occ = math.log(self.p_occupied_given_detection / (1 - self.p_occupied_given_detection))
+        self.log_odds_free = math.log((1 - self.p_free_given_clear) / self.p_free_given_clear)
+
         self.map_publisher = self.create_publisher(OccupancyGrid, robot_prefix + '/map',
                                                    qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST,))
 
         self.get_logger().info(f"Simple mapper set for crazyflie " + robot_prefix +
                                f" using the odom and scan topic")
+        self.get_logger().info(f"Map size: {self.map_size_x}x{self.map_size_y}m "
+                               f"({self.map_width}x{self.map_height} cells)")
+        self.get_logger().info(f"Map origin: ({self.map_origin_x}, {self.map_origin_y}), "
+                               f"resolution: {self.map_resolution}m")
+        self.get_logger().info(f"Bayesian updates: {'enabled' if self.use_bayesian_updates else 'disabled'}")
+        self.get_logger().info(f"Avoidance distance: {self.avoidance_distance}m, "
+                               f"max weight: {self.max_avoidance_weight}")
         self.publish_initial_map()
 
     def publish_initial_map(self):
@@ -68,14 +114,85 @@ class SimpleMapperMultiranger(Node):
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        msg.info.resolution = MAP_RES
-        msg.info.width = int(GLOBAL_SIZE_X / MAP_RES)
-        msg.info.height = int(GLOBAL_SIZE_Y / MAP_RES)
-        msg.info.origin.position.x = -GLOBAL_SIZE_X / 2.0
-        msg.info.origin.position.y = -GLOBAL_SIZE_Y / 2.0
+        msg.info.resolution = self.map_resolution
+        msg.info.width = self.map_width
+        msg.info.height = self.map_height
+        msg.info.origin.position.x = self.map_origin_x
+        msg.info.origin.position.y = self.map_origin_y
         msg.data = self.map
         self.map_publisher.publish(msg)
-        self.get_logger().info("Published initial empty map")
+        self.get_logger().debug("Published initial empty map")
+
+    def bayesian_update_cell(self, map_idx: int, is_occupied: bool):
+        """
+        Safe placeholder when Bayesian mode is disabled.
+        If Bayesian updates are enabled in the future, replace this with a log-odds update.
+        """
+        if not self.use_bayesian_updates:
+            # No-op in simple mode (keep whatever was already set by simple logic)
+            return
+        # Minimalistic behavior if someone toggles it on:
+        # Treat occupied -> 100 (hard), free -> do not overwrite occupied.
+        if is_occupied:
+            self.map[map_idx] = 100
+        else:
+            if self.map[map_idx] in (-1, 0):
+                self.map[map_idx] = 0
+
+    def apply_ray_weights(self, ray_cells, obstacle_distance_cells, map_width, map_height):
+        """
+        Apply lightweight (integer) avoidance weights ONLY along the given ray,
+        focusing near the obstacle end. Never overwrite non-empty cells (not 0 / -1).
+        """
+        if not ray_cells:
+            return
+        # Focus on last K cells near the obstacle (but on the robot side)
+        # Use a small taper so closer-to-obstacle cells get larger weights.
+        K = min(6, max(1, obstacle_distance_cells))  # up to ~6 cells
+        start = max(0, len(ray_cells) - K - 1)
+        window = ray_cells[start:-1] if len(ray_cells) > 1 else []
+
+        # Avoid writing on the obstacle cell itself; we only weight the approach
+        for i, (cx, cy) in enumerate(window):
+            if 0 <= cx < map_width and 0 <= cy < map_height:
+                idx = cy * map_width + cx
+                current = self.map[idx]
+                if current not in (-1, 0):
+                    # Don't overwrite non-empty cells (occupied or previously weighted)
+                    continue
+                # Taper: nearest gets max, farther gets less (at least 1)
+                # i=0 (farther) -> smaller; i=K-1 (near) -> larger
+                w = max(1, int(round((i + 1) * self.max_avoidance_weight / K)))
+                # Store as a small positive weight (1..max_avoidance_weight)
+                self.map[idx] = min(self.max_avoidance_weight, w)
+
+ 
+ # =======================================================================
+ # Utility functions
+ # =======================================================================
+ 
+    def bresenham(x0: int, y0: int, x1: int, y1: int):
+        """
+        Integer Bresenham line from (x0,y0) to (x1,y1), inclusive of both endpoints.
+        Returns a generator of (x,y) cells.
+        """
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            yield (x, y)
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
 
     def euler_from_quaternion(self, x, y, z, w):
         """Convert quaternion to euler angles (roll, pitch, yaw)."""
@@ -97,6 +214,72 @@ class SimpleMapperMultiranger(Node):
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
         return roll, pitch, yaw
+
+    def apply_ray_weights(self, ray_cells, obstacle_distance_cells, map_width, map_height):
+        """
+        Apply weighted zones along the ray from robot to obstacle.
+        Weights increase as we get closer to the obstacle, but only within avoidance_distance.
+
+        Args:
+            ray_cells: List of (x, y) tuples representing cells along the ray
+            obstacle_distance_cells: Total distance from robot to obstacle in grid cells
+            map_width: Width of the map in grid cells
+            map_height: Height of the map in grid cells
+        """
+        if self.avoidance_distance <= 0:
+            return
+
+        # Convert avoidance distance from meters to grid cells
+        avoidance_distance_cells = int(self.avoidance_distance / self.map_resolution)
+
+        if avoidance_distance_cells == 0:
+            return
+
+        # Calculate how many cells from the obstacle should have weights
+        # We want to apply weights to cells within avoidance_distance of the obstacle
+        start_weight_at = max(0, obstacle_distance_cells - avoidance_distance_cells)
+
+        self.get_logger().debug(f"Applying weights along ray: total_dist={obstacle_distance_cells}, "
+                               f"avoidance={avoidance_distance_cells}, start_at={start_weight_at}")
+
+        # Iterate through ray cells, applying weights near the obstacle
+        for i, (cell_x, cell_y) in enumerate(ray_cells):
+            # Skip if out of bounds
+            if not (0 <= cell_x < map_width and 0 <= cell_y < map_height):
+                continue
+
+            # Calculate distance from this cell to the obstacle
+            distance_to_obstacle = obstacle_distance_cells - i
+
+            # Only apply weights within avoidance_distance of obstacle
+            if distance_to_obstacle > avoidance_distance_cells:
+                continue
+
+            # Skip the obstacle cell itself (i == len(ray_cells) - 1)
+            if i == len(ray_cells) - 1:
+                continue
+
+            # Get current map value
+            map_idx = cell_y * map_width + cell_x
+            current_value = self.map[map_idx]
+
+            # Do not replace obstacles (100) or any non-empty cells
+            # Only apply weights to free (0) or unknown (-1) cells
+            if current_value != 0 and current_value != -1:
+                continue
+
+            # Calculate weight: increases as we get closer to obstacle
+            # At avoidance_distance from obstacle: weight = 1
+            # Right next to obstacle: weight = max_avoidance_weight
+            normalized_distance = distance_to_obstacle / avoidance_distance_cells
+            weight = int(self.max_avoidance_weight * (1.0 - normalized_distance))
+            weight = max(1, min(weight, self.max_avoidance_weight))
+
+            self.get_logger().debug(f"Cell ({cell_x},{cell_y}) dist_to_obs={distance_to_obstacle} "
+                                   f"weight={weight}")
+
+            # Apply weight
+            self.map[map_idx] = weight
 
     def odom_subscribe_callback(self, msg):
         self.position[0] = msg.pose.pose.position.x
@@ -123,17 +306,17 @@ class SimpleMapperMultiranger(Node):
         
         data = self.rotate_and_create_points()
         self.get_logger().debug(f"Created {len(data)} obstacle points")
-        
+
         points_x = []
         points_y = []
-        
-        # Calculate map dimensions
-        map_width = int(GLOBAL_SIZE_X / MAP_RES)
-        map_height = int(GLOBAL_SIZE_Y / MAP_RES)
-        
+
+        # Use instance variables for map dimensions
+        map_width = self.map_width
+        map_height = self.map_height
+
         # Calculate current position in map coordinates
-        position_x_map = int((self.position[0] - (-GLOBAL_SIZE_X / 2.0)) / MAP_RES)
-        position_y_map = int((self.position[1] - (-GLOBAL_SIZE_Y / 2.0)) / MAP_RES)
+        position_x_map = int((self.position[0] - self.map_origin_x) / self.map_resolution)
+        position_y_map = int((self.position[1] - self.map_origin_y) / self.map_resolution)
         
         self.get_logger().debug(f"Robot in map coords: ({position_x_map}, {position_y_map}), map size: {map_width}x{map_height}")
         
@@ -143,41 +326,66 @@ class SimpleMapperMultiranger(Node):
             return
         
         obstacle_count = 0
+
         for i in range(len(data)):
-            point_x = int((data[i][0] - (-GLOBAL_SIZE_X / 2.0)) / MAP_RES)
-            point_y = int((data[i][1] - (-GLOBAL_SIZE_Y / 2.0)) / MAP_RES)
-            
+            point_x = int((data[i][0] - self.map_origin_x) / self.map_resolution)
+            point_y = int((data[i][1] - self.map_origin_y) / self.map_resolution)
+
             # Check if point is within map bounds
             if not (0 <= point_x < map_width and 0 <= point_y < map_height):
                 self.get_logger().debug(f"Point ({point_x}, {point_y}) outside bounds, skipping")
                 continue
-            
+
             points_x.append(point_x)
             points_y.append(point_y)
             obstacle_count += 1
-            
-            # Draw line from robot position to detected point
-            for line_x, line_y in bresenham(position_x_map, position_y_map, point_x, point_y):
+
+            # Build the full ray once so we can both clear along it and apply weights on it
+            ray_cells = list(bresenham(position_x_map, position_y_map, point_x, point_y))
+
+            # Update cells along ray from robot to obstacle (free space)
+            for line_x, line_y in ray_cells:
                 if 0 <= line_x < map_width and 0 <= line_y < map_height:
-                    self.map[line_y * map_width + line_x] = 0
-            
+                    map_idx = line_y * map_width + line_x
+
+                    # Use Bayesian update or simple override based on flag
+                    if self.use_bayesian_updates:
+                        # Only update free cells if not already an obstacle
+                        if self.map[map_idx] != 100:
+                            self.bayesian_update_cell(map_idx, is_occupied=False)
+                    else:
+                        # Simple mode: set to free ONLY if currently unknown or already free
+                        # Do NOT overwrite any non-empty (weighted/occupied) cells
+                        if self.map[map_idx] in (-1, 0):
+                            self.map[map_idx] = 0
+
             # Mark detected obstacle point
-            self.map[point_y * map_width + point_x] = 100
-        
+            obstacle_idx = point_y * map_width + point_x
+            if self.use_bayesian_updates:
+                self.bayesian_update_cell(obstacle_idx, is_occupied=True)
+            else:
+                self.map[obstacle_idx] = 100
+
+            # Apply weighted avoidance ONLY along the same ray, near the obstacle
+            obstacle_distance_cells = max(0, len(ray_cells) - 1)
+            self.apply_ray_weights(ray_cells, obstacle_distance_cells, map_width, map_height)
+
+        # (Removed old area/semicircle weighting; weights are now applied per-ray only)
+
         self.get_logger().debug(f"Processed {obstacle_count} obstacles, updating map")
         
         # Create and publish map message
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
-        msg.info.resolution = MAP_RES
+        msg.info.resolution = self.map_resolution
         msg.info.width = map_width
         msg.info.height = map_height
-        msg.info.origin.position.x = -GLOBAL_SIZE_X / 2.0
-        msg.info.origin.position.y = -GLOBAL_SIZE_Y / 2.0
+        msg.info.origin.position.x = self.map_origin_x
+        msg.info.origin.position.y = self.map_origin_y
         msg.data = self.map
         
-        self.get_logger().info(f"Publishing map: {map_width}x{map_height}, {len(self.map)} cells")
+        self.get_logger().debug(f"Publishing map: {map_width}x{map_height}, {len(self.map)} cells")
         self.map_publisher.publish(msg)
 
     def rotate_and_create_points(self):

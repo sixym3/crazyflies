@@ -10,7 +10,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from sensor_msgs.msg import Range, LaserScan
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 
 import cflib.crtp
@@ -24,6 +24,10 @@ class CrazyflieNode(Node):
 
     def __init__(self):
         super().__init__('crazyflie_node')
+
+        self.motors_killed = False
+        self._last_stop_send = 0
+        self._last_blocked_warning = 0.0    
 
         # ---------- Parameters ----------
         self.declare_parameter('uri', 'radio://0/80/2M/E7E7E7E7E2')
@@ -79,6 +83,7 @@ class CrazyflieNode(Node):
 
         # ---------- Subscribers ----------
         self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+        self.emergency_stop_sub = self.create_subscription(Bool, '/crazyflie/emergency_stop', self.emergency_stop_callback, 10)
 
         # ---------- TF ----------
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -132,12 +137,48 @@ class CrazyflieNode(Node):
 
     def cmd_vel_callback(self, msg: Twist):
         """Handle incoming velocity commands."""
+        if self.motors_killed:
+            # Reject commands when e-stop is active (with throttled logging)
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            if current_time - self._last_blocked_warning > 2.0:  # Log every 2 seconds
+                self.get_logger().warn('Rejecting cmd_vel - emergency stop is active')
+                self._last_blocked_warning = current_time
+            return
         with self.cmd_lock:
             self.cmd_vel = msg
+
+    def emergency_stop_callback(self, msg: Bool):
+        """Handle emergency stop command - sends stop setpoint to kill motors."""
+        if not msg.data:
+            # Ignore false/reset messages - e-stop is permanent until node restart
+            return
+
+        if self.motors_killed:
+            # E-stop already active, ignore duplicate commands
+            return
+
+        # First e-stop trigger
+        self.get_logger().warn('Emergency stop triggered - killing motors and halting all commands')
+        self.motors_killed = True
+
+        try:
+            self.cf.commander.send_stop_setpoint()
+            self.get_logger().info('Stop setpoint sent to Crazyflie')
+        except Exception as e:
+            self.get_logger().error(f'Failed to send stop setpoint: {e}')
 
     def send_control_command(self):
         """Send velocity commands to Crazyflie at 10Hz."""
         if self.logging_only:
+            return
+
+        # If e-stop is active, keep sending stop setpoints to maintain connection
+        if self.motors_killed:
+            try:
+                self.cf.commander.send_stop_setpoint()
+            except Exception as e:
+                # Log errors but don't spam (already logged in emergency_stop_callback)
+                pass
             return
 
         with self.cmd_lock:
@@ -147,7 +188,7 @@ class CrazyflieNode(Node):
 
             # Height adjustment via small increments (hover setpoint)
             if abs(self.cmd_vel.linear.z) > 1e-9:
-                self.hover_height += self.cmd_vel.linear.z * 0.01
+                self.hover_height += self.cmd_vel.linear.z * 0.1
                 self.hover_height = max(0.1, min(1.0, self.hover_height))
 
         # Send hover setpoint
