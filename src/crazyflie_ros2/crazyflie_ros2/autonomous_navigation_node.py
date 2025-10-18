@@ -304,8 +304,7 @@ class AutonomousNavigationNode(Node):
 
         # Check if we've reached the end of the path
         if self.current_waypoint_idx >= len(self.planned_path):
-            self.get_logger().info('STATE CHANGE: FOLLOW -> LAND (goal reached)')
-            self.state = 'LAND'
+            # Don't automatically land - wait for edge detection to trigger landing
             self._publish_zero_velocity()
             return
 
@@ -318,10 +317,7 @@ class AutonomousNavigationNode(Node):
         # Check if we've reached the current waypoint
         if dist < self.waypoint_tolerance:
             self.current_waypoint_idx += 1
-            if self.current_waypoint_idx >= len(self.planned_path):
-                self.get_logger().info('STATE CHANGE: FOLLOW -> LAND (goal reached)')
-                self.state = 'LAND'
-                self._publish_zero_velocity()
+            # Don't automatically land when reaching final waypoint - wait for edge detection
             return
 
         # Move towards current waypoint

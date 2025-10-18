@@ -31,11 +31,6 @@ class SimpleMapperMultiranger(Node):
         self.declare_parameter('avoidance_distance', 0.5)  # meters
         self.declare_parameter('max_avoidance_weight', 50)  # 1-50 range for weights
 
-        # Bayesian occupancy grid parameters
-        # Default OFF for simple ray logic (no Bayesian probabilities)
-        self.declare_parameter('use_bayesian_updates', False)
-        self.use_bayesian_updates = self.get_parameter('use_bayesian_updates').value
-
         # Map size and origin parameters (Option B: extends in +X direction)
         self.declare_parameter('map_size_x', 40.0)  # meters (default 40m, was 20m)
         self.declare_parameter('map_size_y', 20.0)  # meters
@@ -47,7 +42,6 @@ class SimpleMapperMultiranger(Node):
         robot_prefix = self.get_parameter('robot_prefix').value
         self.avoidance_distance = self.get_parameter('avoidance_distance').value
         self.max_avoidance_weight = self.get_parameter('max_avoidance_weight').value
-        self.use_bayesian_updates = self.get_parameter('use_bayesian_updates').value
 
         # Map configuration
         self.map_size_x = self.get_parameter('map_size_x').value
@@ -85,16 +79,6 @@ class SimpleMapperMultiranger(Node):
         # Initialize occupancy grid (-1 = unknown)
         self.map = [-1] * map_size
 
-        # Initialize log-odds grid for Bayesian updates (0 = 50% probability)
-        # Log-odds = log(p / (1-p)), where p is probability of occupancy
-        self.log_odds = np.zeros(map_size, dtype=np.float32)
-
-        # Bayesian update probabilities
-        self.p_occupied_given_detection = 0.9  # 90% confidence when obstacle detected
-        self.p_free_given_clear = 0.7  # 70% confidence when ray passes through
-        self.log_odds_occ = math.log(self.p_occupied_given_detection / (1 - self.p_occupied_given_detection))
-        self.log_odds_free = math.log((1 - self.p_free_given_clear) / self.p_free_given_clear)
-
         self.map_publisher = self.create_publisher(OccupancyGrid, robot_prefix + '/map',
                                                    qos_profile=QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST,))
 
@@ -104,7 +88,6 @@ class SimpleMapperMultiranger(Node):
                                f"({self.map_width}x{self.map_height} cells)")
         self.get_logger().info(f"Map origin: ({self.map_origin_x}, {self.map_origin_y}), "
                                f"resolution: {self.map_resolution}m")
-        self.get_logger().info(f"Bayesian updates: {'enabled' if self.use_bayesian_updates else 'disabled'}")
         self.get_logger().info(f"Avoidance distance: {self.avoidance_distance}m, "
                                f"max weight: {self.max_avoidance_weight}")
         self.publish_initial_map()
@@ -122,22 +105,6 @@ class SimpleMapperMultiranger(Node):
         msg.data = self.map
         self.map_publisher.publish(msg)
         self.get_logger().debug("Published initial empty map")
-
-    def bayesian_update_cell(self, map_idx: int, is_occupied: bool):
-        """
-        Safe placeholder when Bayesian mode is disabled.
-        If Bayesian updates are enabled in the future, replace this with a log-odds update.
-        """
-        if not self.use_bayesian_updates:
-            # No-op in simple mode (keep whatever was already set by simple logic)
-            return
-        # Minimalistic behavior if someone toggles it on:
-        # Treat occupied -> 100 (hard), free -> do not overwrite occupied.
-        if is_occupied:
-            self.map[map_idx] = 100
-        else:
-            if self.map[map_idx] in (-1, 0):
-                self.map[map_idx] = 0
 
     def apply_ray_weights(self, ray_cells, obstacle_distance_cells, map_width, map_height):
         """
@@ -215,72 +182,6 @@ class SimpleMapperMultiranger(Node):
 
         return roll, pitch, yaw
 
-    def apply_ray_weights(self, ray_cells, obstacle_distance_cells, map_width, map_height):
-        """
-        Apply weighted zones along the ray from robot to obstacle.
-        Weights increase as we get closer to the obstacle, but only within avoidance_distance.
-
-        Args:
-            ray_cells: List of (x, y) tuples representing cells along the ray
-            obstacle_distance_cells: Total distance from robot to obstacle in grid cells
-            map_width: Width of the map in grid cells
-            map_height: Height of the map in grid cells
-        """
-        if self.avoidance_distance <= 0:
-            return
-
-        # Convert avoidance distance from meters to grid cells
-        avoidance_distance_cells = int(self.avoidance_distance / self.map_resolution)
-
-        if avoidance_distance_cells == 0:
-            return
-
-        # Calculate how many cells from the obstacle should have weights
-        # We want to apply weights to cells within avoidance_distance of the obstacle
-        start_weight_at = max(0, obstacle_distance_cells - avoidance_distance_cells)
-
-        self.get_logger().debug(f"Applying weights along ray: total_dist={obstacle_distance_cells}, "
-                               f"avoidance={avoidance_distance_cells}, start_at={start_weight_at}")
-
-        # Iterate through ray cells, applying weights near the obstacle
-        for i, (cell_x, cell_y) in enumerate(ray_cells):
-            # Skip if out of bounds
-            if not (0 <= cell_x < map_width and 0 <= cell_y < map_height):
-                continue
-
-            # Calculate distance from this cell to the obstacle
-            distance_to_obstacle = obstacle_distance_cells - i
-
-            # Only apply weights within avoidance_distance of obstacle
-            if distance_to_obstacle > avoidance_distance_cells:
-                continue
-
-            # Skip the obstacle cell itself (i == len(ray_cells) - 1)
-            if i == len(ray_cells) - 1:
-                continue
-
-            # Get current map value
-            map_idx = cell_y * map_width + cell_x
-            current_value = self.map[map_idx]
-
-            # Do not replace obstacles (100) or any non-empty cells
-            # Only apply weights to free (0) or unknown (-1) cells
-            if current_value != 0 and current_value != -1:
-                continue
-
-            # Calculate weight: increases as we get closer to obstacle
-            # At avoidance_distance from obstacle: weight = 1
-            # Right next to obstacle: weight = max_avoidance_weight
-            normalized_distance = distance_to_obstacle / avoidance_distance_cells
-            weight = int(self.max_avoidance_weight * (1.0 - normalized_distance))
-            weight = max(1, min(weight, self.max_avoidance_weight))
-
-            self.get_logger().debug(f"Cell ({cell_x},{cell_y}) dist_to_obs={distance_to_obstacle} "
-                                   f"weight={weight}")
-
-            # Apply weight
-            self.map[map_idx] = weight
-
     def odom_subscribe_callback(self, msg):
         self.position[0] = msg.pose.pose.position.x
         self.position[1] = msg.pose.pose.position.y
@@ -347,24 +248,14 @@ class SimpleMapperMultiranger(Node):
             for line_x, line_y in ray_cells:
                 if 0 <= line_x < map_width and 0 <= line_y < map_height:
                     map_idx = line_y * map_width + line_x
-
-                    # Use Bayesian update or simple override based on flag
-                    if self.use_bayesian_updates:
-                        # Only update free cells if not already an obstacle
-                        if self.map[map_idx] != 100:
-                            self.bayesian_update_cell(map_idx, is_occupied=False)
-                    else:
-                        # Simple mode: set to free ONLY if currently unknown or already free
-                        # Do NOT overwrite any non-empty (weighted/occupied) cells
-                        if self.map[map_idx] in (-1, 0):
-                            self.map[map_idx] = 0
+                    # Set to free ONLY if currently unknown or already free
+                    # Do NOT overwrite any non-empty (weighted/occupied) cells
+                    if self.map[map_idx] in (-1, 0):
+                        self.map[map_idx] = 0
 
             # Mark detected obstacle point
             obstacle_idx = point_y * map_width + point_x
-            if self.use_bayesian_updates:
-                self.bayesian_update_cell(obstacle_idx, is_occupied=True)
-            else:
-                self.map[obstacle_idx] = 100
+            self.map[obstacle_idx] = 100
 
             # Apply weighted avoidance ONLY along the same ray, near the obstacle
             obstacle_distance_cells = max(0, len(ray_cells) - 1)

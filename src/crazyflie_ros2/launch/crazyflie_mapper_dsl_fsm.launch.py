@@ -1,5 +1,5 @@
-#!/home/eric/crazyflies/.venv/bin/python3
-"""Launch file for Crazyflie simulation with mapper, D* Lite planning, and FSM navigation."""
+#!/usr/bin/env python3
+"""Launch file for Crazyflie hardware with mapper, D* Lite planning, and FSM navigation."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -8,6 +8,11 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     log_level_arg = DeclareLaunchArgument('log_level', default_value='info')
+
+    # Crazyflie parameters
+    uri_arg = DeclareLaunchArgument(
+        'uri', default_value='radio://0/80/2M/E7E7E7E7E2',
+        description='Crazyflie URI')
 
     # Planning parameters
     planning_frequency_arg = DeclareLaunchArgument(
@@ -38,6 +43,7 @@ def generate_launch_description():
 
     def setup(context, *args, **kwargs):
         log_level = LaunchConfiguration('log_level').perform(context)
+        uri = LaunchConfiguration('uri').perform(context)
         planning_frequency = float(LaunchConfiguration('planning_frequency').perform(context))
         flight_height = float(LaunchConfiguration('flight_height').perform(context))
         avoidance_distance = float(LaunchConfiguration('avoidance_distance').perform(context))
@@ -45,26 +51,21 @@ def generate_launch_description():
         waypoint_tolerance = float(LaunchConfiguration('waypoint_tolerance').perform(context))
         scanning_yaw_rate = float(LaunchConfiguration('scanning_yaw_rate').perform(context))
 
-        crazyflie_sim_node = Node(
+        crazyflie_node = Node(
             package='crazyflie_ros2',
-            executable='crazyflie_sim_node',
-            name='crazyflie_sim_node',
+            executable='crazyflie_node',
+            name='crazyflie_node',
             output='screen',
-            arguments=['--ros-args', '--log-level', f'crazyflie_sim_node:={log_level}'],
+            arguments=['--ros-args', '--log-level', f'crazyflie_node:={log_level}'],
             parameters=[{
-                'frame_id': 'crazyflie',
+                'uri': uri,
+                'hover_height': flight_height,
+                'speed_factor': 0.3,
+                'logging_only': False,
                 'map_frame': 'map',
                 'world_frame': 'world',
                 'odom_frame': 'crazyflie/odom',
                 'base_frame': 'crazyflie',
-                'publish_rate_hz': 10.0,
-                'takeoff_height': 0.5,
-                'default_yaw_rate': 0.3,
-                'speed_limit': 1.0,
-                'yaw_rate_limit': 2.0,
-                'box_half_xy': 3.75,  # 50% larger (7.5x7.5m)
-                'box_height': 2.0,
-                'responsiveness': 0.3,  # Slower response like real drone
             }]
         )
 
@@ -80,9 +81,9 @@ def generate_launch_description():
                 'avoidance_distance': avoidance_distance,
                 'max_avoidance_weight': max_avoidance_weight,
                 # Map configuration (Option B: extends in +X direction)
-                'map_size_x': 20.0,           # meters (40m x 20m map)
+                'map_size_x': 20.0,           # meters (20m x 20m map)
                 'map_size_y': 20.0,           # meters
-                'map_origin_x': -10.0,        # X range: -10 to +30m
+                'map_origin_x': -10.0,        # X range: -10 to +10m
                 'map_origin_y': -10.0,        # Y range: -10 to +10m
                 'map_resolution': 0.1,        # meters per cell
             }]
@@ -127,14 +128,14 @@ def generate_launch_description():
                 'topic': '/crazyflie/range/down',
                 'window': 20,
                 'z_thresh': 3.8,
-                'expected_height_m': 0.5,
+                'expected_height_m': flight_height,
                 'log_csv': True,
                 'log_dir': 'logs'
             }]
         )
 
         return [
-            crazyflie_sim_node,
+            crazyflie_node,
             simple_mapper_node,
             dstarlite_path_planning_node,
             autonomous_navigation_node,
@@ -143,6 +144,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         log_level_arg,
+        uri_arg,
         planning_frequency_arg,
         flight_height_arg,
         avoidance_distance_arg,

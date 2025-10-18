@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/eric/crazyflies/.venv/bin/python3
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
@@ -41,7 +41,6 @@ def generate_launch_description():
             arguments=['--ros-args', '--log-level', f'simple_mapper_node:={log_level}'],
             parameters=[{
                 'robot_prefix': '/crazyflie',
-                'use_bayesian_updates': True,  # Enable Bayesian occupancy updates
                 'avoidance_distance': 0.5,     # meters
                 'max_avoidance_weight': 50,    # 1-50 range
                 # Map configuration (Option B: extends in +X direction)
