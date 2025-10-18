@@ -1,1 +1,0 @@
-/home/eric/crazyflies/build/crazyflie_ros2/launch/crazyflie_with_simple_mapper.launch.py
