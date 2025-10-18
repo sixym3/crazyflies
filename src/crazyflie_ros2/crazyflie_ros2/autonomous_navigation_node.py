@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Autonomous Navigation Node for Crazyflie (Finite State Machine with Active Scanning)
+Autonomous Navigation Node for Crazyflie (Waypoint Following with Active Scanning)
 
-Subscribes to path waypoints from a separate path planning node and executes
-finite state machine control (IDLE, TAKEOFF, FOLLOW, LAND) with active scanning.
+Subscribes to path waypoints from a separate path planning node and follows them
+with active scanning. Enabled/disabled via service by mode_manager_node.
 
 Subscribes to:
   /planned_path (nav_msgs/Path) - waypoints from path planner
   /crazyflie/pose (geometry_msgs/PoseStamped)
-  /goal_pose (geometry_msgs/PoseStamped)
-  /perception/edge_event (std_msgs/Bool)
 
 Publishes:
   /cmd_vel (geometry_msgs/Twist)
   /nav/cmd_vel_plan (geometry_msgs/Twist)
   /nav/cmd_vel_active (geometry_msgs/Twist)
-  /goal_marker (visualization_msgs/Marker)
-  /crazyflie/emergency_stop (std_msgs/Bool)
 """
 
 import rclpy
@@ -25,11 +21,9 @@ from rclpy.node import Node
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Twist
 from std_srvs.srv import SetBool
-from visualization_msgs.msg import Marker
 
 import numpy as np
 import math
-from std_msgs.msg import Bool
 
 
 class ActiveScanningController:
@@ -109,7 +103,7 @@ class ActiveScanningController:
 
 
 class AutonomousNavigationNode(Node):
-    """ROS2 node for autonomous navigation FSM with active scanning wrapper."""
+    """ROS2 node for waypoint following with active scanning."""
 
     def __init__(self):
         super().__init__('autonomous_navigation_node')
@@ -123,32 +117,21 @@ class AutonomousNavigationNode(Node):
         self.scanning_yaw_rate = self.get_parameter('scanning_yaw_rate').value
         self.flight_height = self.get_parameter('flight_height').value
 
-        self.state = 'IDLE'   # IDLE, TAKEOFF, FOLLOW, LAND
-
         # State
         self.enabled = False
         self.current_pose = None
-        self.goal_pose = None
         self.planned_path = []
         self.current_waypoint_idx = 0
-
-        # Edge detection during FOLLOW
-        self.follow_start_time = None
-        self.edge_detection_delay = 2.0  # seconds to wait before activating edge detection
 
         # Controller
         self.controller = ActiveScanningController(self)
 
         # Subscribers
         self.pose_sub = self.create_subscription(PoseStamped, '/crazyflie/pose', self.pose_callback, 10)
-        self.goal_sub = self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
         self.path_sub = self.create_subscription(Path, '/planned_path', self.path_callback, 10)
-        self.edge_event_sub = self.create_subscription(Bool, '/perception/edge_event', self.edge_cb, 10)
 
         # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.goal_marker_pub = self.create_publisher(Marker, '/goal_marker', 10)
-        self.emergency_stop_pub = self.create_publisher(Bool, '/crazyflie/emergency_stop', 10)
 
         # Services
         self.enable_srv = self.create_service(SetBool, '/enable_autonomous', self.enable_callback)
@@ -157,31 +140,23 @@ class AutonomousNavigationNode(Node):
         self.control_timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
         self.status_timer = self.create_timer(5.0, self.status_loop)
 
-        self.get_logger().info('Autonomous Navigation Node (FSM + Active Scanning) initialized')
-        self.get_logger().info(f'Initial state: {self.state}')
-        self.get_logger().info('Waiting for planned path on /planned_path...')
+        self.get_logger().info('Autonomous Navigation Node initialized (disabled)')
 
     # ----- Callbacks -----
     def pose_callback(self, msg):
         was_none = self.current_pose is None
         self.current_pose = msg
         if was_none:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'Received first pose: ({msg.pose.position.x:.2f}, '
                 f'{msg.pose.position.y:.2f}, {msg.pose.position.z:.2f})')
-
-    def goal_callback(self, msg):
-        self.goal_pose = msg
-        self.get_logger().info(
-            f'New goal received: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f})')
-        self._publish_goal_marker()
 
     def path_callback(self, msg: Path):
         """Receive planned path from path planning node."""
         if len(msg.poses) > 0:
             self.planned_path = msg.poses
             self.current_waypoint_idx = 0
-            self.get_logger().info(f'Received path with {len(msg.poses)} waypoints')
+            self.get_logger().debug(f'Received path with {len(msg.poses)} waypoints')
 
     def enable_callback(self, request, response):
         self.enabled = request.data
@@ -191,120 +166,22 @@ class AutonomousNavigationNode(Node):
         if not self.enabled:
             self._publish_zero_velocity()
             self.current_waypoint_idx = 0
-            self.get_logger().info("Navigation disabled - stopping drone")
         return response
 
 
-    def edge_cb(self, msg: Bool):
-        """Handle edge detection events - transition to LAND when edge detected during FOLLOW."""
-        if not self.enabled or not msg.data:
-            return
-
-        # During FOLLOW state, check if edge detection is active (after delay)
-        if self.state == 'FOLLOW':
-            if self.follow_start_time is None:
-                return
-
-            current_time = self.get_clock().now().nanoseconds / 1e9
-            elapsed = current_time - self.follow_start_time
-
-            if elapsed < self.edge_detection_delay:
-                return  # Not ready yet
-
-            # Edge detected during FOLLOW - transition directly to LAND
-            self.get_logger().info('EDGE detected in FOLLOW → STATE CHANGE: FOLLOW -> LAND')
-            self.state = 'LAND'
-            self._publish_zero_velocity()
-            return
-
     # ----- Control Loop -----
     def control_loop(self):
-        if not self.enabled:
-            # Log every 100 calls (~10 seconds) to avoid spam
-            if not hasattr(self, '_disabled_log_count'):
-                self._disabled_log_count = 0
-            self._disabled_log_count += 1
-            if self._disabled_log_count >= 100:
-                self.get_logger().warn(f'Control loop blocked: enabled={self.enabled}')
-                self._disabled_log_count = 0
+        """Main control loop - follows waypoints when enabled."""
+        if not self.enabled or self.current_pose is None:
             return
 
-        if self.current_pose is None:
-            if not hasattr(self, '_no_pose_log_count'):
-                self._no_pose_log_count = 0
-            self._no_pose_log_count += 1
-            if self._no_pose_log_count >= 100:
-                self.get_logger().warn(f'Control loop blocked: no pose data')
-                self._no_pose_log_count = 0
-            return
-
-        # Simple state transitions (expand as you like)
-        if self.state == 'IDLE':
-            if self.goal_pose is not None:
-                self.get_logger().info(f'STATE CHANGE: IDLE -> TAKEOFF')
-                self.state = 'TAKEOFF'
-            else:
-                # Don't publish zero velocity in IDLE - allow manual control
-                return
-
-        if self.state == 'TAKEOFF':
-            # altitude hold is already done by controller via flight_height
-            # just wait until close to target height, then follow path
-            # Log altitude status periodically
-            if not hasattr(self, '_takeoff_log_count'):
-                self._takeoff_log_count = 0
-            self._takeoff_log_count += 1
-            if self._takeoff_log_count >= 50:  # Log every 5 seconds
-                alt_diff = abs(self.current_pose.pose.position.z - self.flight_height)
-                self.get_logger().info(f'TAKEOFF: current_alt={self.current_pose.pose.position.z:.3f}m, target={self.flight_height:.3f}m, diff={alt_diff:.3f}m')
-                self._takeoff_log_count = 0
-
-            if abs(self.current_pose.pose.position.z - self.flight_height) < 0.05:
-                self.get_logger().info(f'STATE CHANGE: TAKEOFF -> FOLLOW (altitude reached: {self.current_pose.pose.position.z:.3f}m)')
-                self.state = 'FOLLOW'
-                self.follow_start_time = self.get_clock().now().nanoseconds / 1e9
-            else:
-                # Send command to climb to target altitude
-                v_world = np.array([0.0, 0.0, 0.0], dtype=float)  # No horizontal movement during takeoff
-                cmd = self.controller.compute(self.current_pose, v_world, self.scanning_yaw_rate, self.flight_height)
-                self.cmd_vel_pub.publish(cmd)
-            return
-
-
-
-        if self.state == 'LAND':
-            if not hasattr(self, '_last_land_log') or (self.get_clock().now().nanoseconds - self._last_land_log) > 5e8:
-                self.get_logger().info(f'LAND: z={self.current_pose.pose.position.z:.2f} → target={self.flight_height:.2f}')
-                self._last_land_log = self.get_clock().now().nanoseconds
-
-            # Gradually lower the target altitude
-            self.flight_height = max(0.12, self.flight_height - 0.01)  # Descend ~0.1 m/s at 10 Hz
-
-            # Send command with lowered altitude setpoint through controller
-            v_world = np.array([0.0, 0.0, 0.0], dtype=float)  # No horizontal movement
-            cmd = self.controller.compute(self.current_pose, v_world, 0.0, self.flight_height)
-            self.cmd_vel_pub.publish(cmd)
-
-            # Check if we've reached minimum safe hover height
-            if self.flight_height <= 0.12 or self.current_pose.pose.position.z < 0.15:
-                self.get_logger().info("Landing complete - sending emergency stop")
-                self._publish_zero_velocity()
-                # Send emergency stop to kill motors
-                stop_msg = Bool()
-                stop_msg.data = True
-                self.emergency_stop_pub.publish(stop_msg)
-                self.enabled = False  # Disable autonomous control
-                self.state = 'IDLE'
-            return
-
-        # Normal FOLLOW behavior - follow planned path waypoints
+        # If no path, hover in place
         if not self.planned_path:
             self._publish_zero_velocity()
             return
 
         # Check if we've reached the end of the path
         if self.current_waypoint_idx >= len(self.planned_path):
-            # Don't automatically land - wait for edge detection to trigger landing
             self._publish_zero_velocity()
             return
 
@@ -317,7 +194,6 @@ class AutonomousNavigationNode(Node):
         # Check if we've reached the current waypoint
         if dist < self.waypoint_tolerance:
             self.current_waypoint_idx += 1
-            # Don't automatically land when reaching final waypoint - wait for edge detection
             return
 
         # Move towards current waypoint
@@ -330,47 +206,29 @@ class AutonomousNavigationNode(Node):
 
     # ----- Utilities -----
     def status_loop(self):
+        """Periodic status logging."""
         if not self.enabled:
             return
 
-        parts = ["ENABLED", f"state={self.state}"]
+        parts = ["ENABLED"]
 
         if self.current_pose is None:
-            parts.append("⚠ NO_POSE")
+            parts.append("NO_POSE")
         else:
             parts.append(f"pose=({self.current_pose.pose.position.x:.1f},"
                         f"{self.current_pose.pose.position.y:.1f})")
 
-        if self.goal_pose is None:
-            parts.append("⚠ NO_GOAL")
-        else:
-            parts.append(f"goal=({self.goal_pose.pose.position.x:.1f},"
-                        f"{self.goal_pose.pose.position.y:.1f})")
-
         if not self.planned_path:
-            parts.append("⚠ NO_PATH")
+            parts.append("NO_PATH")
         else:
             parts.append(f"path={len(self.planned_path)} waypoints "
                         f"(at {self.current_waypoint_idx})")
 
-        self.get_logger().info("Status: " + " | ".join(parts))
+        self.get_logger().debug("Status: " + " | ".join(parts))
 
     def _publish_zero_velocity(self):
+        """Stop the drone."""
         self.cmd_vel_pub.publish(Twist())
-
-    def _publish_goal_marker(self):
-        if self.goal_pose is None: return
-        marker = Marker()
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.header.frame_id = self.goal_pose.header.frame_id
-        marker.ns = "goal"
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose = self.goal_pose.pose
-        marker.scale.x = marker.scale.y = marker.scale.z = 0.2
-        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0; marker.color.a = 1.0
-        self.goal_marker_pub.publish(marker)
 
 
 

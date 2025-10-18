@@ -100,7 +100,7 @@ class DStarLitePlanner:
             if old_cost_map is not None and self.initialized:
                 changed_cells = np.argwhere(old_cost_map != cost_map)
                 if len(changed_cells) > 0:
-                    self.logger.info(f"Detected {len(changed_cells)} changed cells, replanning...")
+                    self.logger.debug(f"Detected {len(changed_cells)} changed cells, replanning...")
                     self.handle_cost_changes(changed_cells)
 
     def handle_cost_changes(self, changed_cells: np.ndarray):
@@ -175,12 +175,18 @@ class DStarLitePlanner:
 
     def initialize(self, start: DStarNode, goal: DStarNode):
         """Initialize D* Lite search."""
+        goal_changed = self.initialized and not compare_coordinates(self.goal, goal)
+
         self.start = DStarNode(start.x, start.y)
         self.goal = DStarNode(goal.x, goal.y)
 
-        if not self.initialized:
+        if not self.initialized or goal_changed:
+            if goal_changed:
+                self.logger.info(f'Goal changed, reinitializing D* Lite')
+            else:
+                self.logger.info('D* Lite initialized')
+
             self.initialized = True
-            self.logger.info('D* Lite initialized')
             self.U = []
             self.km = 0.0
             self.rhs = self.create_grid(math.inf)
@@ -295,7 +301,7 @@ class DStarLitePlanner:
 
             if compare_coordinates(current, self.goal):
                 path.append((self.goal.x, self.goal.y))
-                self.logger.info(f"D* Lite path found with {len(path)} waypoints")
+                self.logger.debug(f"D* Lite path found with {len(path)} waypoints")
             else:
                 self.logger.warning(f"Path computation stopped after {steps} steps")
 
@@ -362,7 +368,7 @@ class DStarLitePathPlanningNode(Node):
                 msg.info.height,
                 self.get_logger()
             )
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'Received first occupancy grid: {msg.info.width}x{msg.info.height}, '
                 f'res={msg.info.resolution}m')
 
@@ -376,7 +382,7 @@ class DStarLitePathPlanningNode(Node):
         was_none = self.current_pose is None
         self.current_pose = msg
         if was_none:
-            self.get_logger().info(
+            self.get_logger().debug(
                 f'Received first pose: ({msg.pose.position.x:.2f}, '
                 f'{msg.pose.position.y:.2f}, {msg.pose.position.z:.2f})')
 
@@ -448,7 +454,7 @@ class DStarLitePathPlanningNode(Node):
         else:
             parts.append("NO_PATH")
 
-        self.get_logger().info("Status: " + " | ".join(parts))
+        self.get_logger().debug("Status: " + " | ".join(parts))
 
     # ----- Utilities -----
     def _occupancy_to_cost_map(self, grid_msg: OccupancyGrid) -> np.ndarray:

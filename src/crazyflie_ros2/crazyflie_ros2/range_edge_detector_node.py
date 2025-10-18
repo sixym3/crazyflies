@@ -46,6 +46,8 @@ class RangeEdgeDetector(Node):
         self.samples = deque(maxlen=self.window)     # (t, r)
         self.deltas  = deque(maxlen=self.window)     # (t, dr/dt)
         self.last_edge = False
+        self.msg_count = 0
+        self.edge_count = 0
 
         # ---- Logging ----
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -57,7 +59,9 @@ class RangeEdgeDetector(Node):
             self.writer.writerow(['time_ns','time_iso','range_m','height_err_m','delta_m_per_s','zscore_delta','edge_flag'])
             self.get_logger().info(f'Logging edges to {path}')
 
-        self.get_logger().info(f'Edge detector listening on {self.topic} (win={self.window}, z≥{self.z_thresh})')
+        self.get_logger().info(
+            f'Edge detector initialized: listening on {self.topic}, '
+            f'window={self.window}, z_thresh={self.z_thresh}, expected_height={self.expected_h}m')
 
     def now(self):
         return self.get_clock().now()
@@ -68,6 +72,16 @@ class RangeEdgeDetector(Node):
         r = float(msg.range)
         if math.isnan(r) or math.isinf(r):
             return
+
+        self.msg_count += 1
+
+        # Log periodic status to show it's running
+        if self.msg_count == 1:
+            self.get_logger().info('Edge detector started - receiving range data')
+        elif self.msg_count % 500 == 0:  # Every ~10 seconds at 50Hz
+            self.get_logger().info(
+                f'Edge detector active: {self.msg_count} range samples processed, '
+                f'{self.edge_count} edges detected')
 
         # Append, compute derivative
         if self.samples:
@@ -101,6 +115,7 @@ class RangeEdgeDetector(Node):
         self.delta_pub.publish(Float32(data=float(drdt)))
 
         if edge_msg.data:
+            self.edge_count += 1
             self.edge_pub.publish(edge_msg)
             # Optionally publish a PointStamped "edge point" using current time in /map or /world if you fuse pose here.
             pt = PointStamped()
@@ -108,7 +123,8 @@ class RangeEdgeDetector(Node):
             pt.header.frame_id = 'world'  # adjust if you choose another frame
             # Leave zero; your nav node can stamp position using current pose when it receives edge_event.
             self.edge_point_pub.publish(pt)
-            self.get_logger().warn(f'EDGE | z={z:.2f}, dr/dt={drdt:.3f}, r={r:.3f} m')
+            self.get_logger().warn(
+                f'EDGE DETECTED #{self.edge_count} | z-score={z:.2f}, dr/dt={drdt:.3f}, range={r:.3f}m')
 
         # CSV log compatible w/ offline analyzer
         if self.csv:
