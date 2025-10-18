@@ -244,7 +244,7 @@ class AutonomousNavigationNode(Node):
                 self.get_logger().info(f'STATE CHANGE: IDLE -> TAKEOFF')
                 self.state = 'TAKEOFF'
             else:
-                self._publish_zero_velocity()
+                # Don't publish zero velocity in IDLE - allow manual control
                 return
 
         if self.state == 'TAKEOFF':
