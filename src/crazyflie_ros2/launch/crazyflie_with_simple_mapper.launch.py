@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch file for Crazyflie with Simple 2D Mapper."""
 
 from launch import LaunchDescription
@@ -72,7 +71,7 @@ def generate_launch_description():
         parameters=[{
             'robot_prefix': LaunchConfiguration('robot_prefix'),
             'use_bayesian_updates': True,  # Enable Bayesian occupancy updates
-            'avoidance_distance': 0.5,     # meters
+            'avoidance_distance': 0.6,     # meters (increased by 0.1m)
             'max_avoidance_weight': 50,    # 1-50 range
             # Map configuration (Option B: extends in +X direction)
             'map_size_x': 40.0,           # meters (40m x 20m map)

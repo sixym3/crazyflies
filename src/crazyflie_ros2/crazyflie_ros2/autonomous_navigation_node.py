@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Autonomous Navigation Node for Crazyflie (Waypoint Following with Active Scanning)
 
@@ -138,7 +137,7 @@ class AutonomousNavigationNode(Node):
 
         # Timers
         self.control_timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
-        self.status_timer = self.create_timer(5.0, self.status_loop)
+        self.status_timer = self.create_timer(1.0, self.status_loop)  # 1 Hz status updates
 
         self.get_logger().info('Autonomous Navigation Node initialized (disabled)')
 
@@ -192,7 +191,11 @@ class AutonomousNavigationNode(Node):
         dist = math.hypot(dx, dy)
 
         # Check if we've reached the current waypoint
-        if dist < self.waypoint_tolerance:
+        # Use tighter tolerance for final waypoint (goal_pose)
+        is_final_waypoint = (self.current_waypoint_idx == len(self.planned_path) - 1)
+        tolerance = self.waypoint_tolerance / 5.0 if is_final_waypoint else self.waypoint_tolerance
+
+        if dist < tolerance:
             self.current_waypoint_idx += 1
             return
 
@@ -210,21 +213,41 @@ class AutonomousNavigationNode(Node):
         if not self.enabled:
             return
 
-        parts = ["ENABLED"]
+        parts = ["AUTONOMOUS_NAV"]
 
         if self.current_pose is None:
             parts.append("NO_POSE")
-        else:
-            parts.append(f"pose=({self.current_pose.pose.position.x:.1f},"
-                        f"{self.current_pose.pose.position.y:.1f})")
+            self.get_logger().info("Status: " + " | ".join(parts))
+            return
+
+        # Current position
+        curr_x = self.current_pose.pose.position.x
+        curr_y = self.current_pose.pose.position.y
+        curr_z = self.current_pose.pose.position.z
+        parts.append(f"pos=({curr_x:.2f},{curr_y:.2f},{curr_z:.2f})")
 
         if not self.planned_path:
             parts.append("NO_PATH")
         else:
-            parts.append(f"path={len(self.planned_path)} waypoints "
-                        f"(at {self.current_waypoint_idx})")
+            # Path information
+            parts.append(f"waypoint={self.current_waypoint_idx}/{len(self.planned_path)}")
 
-        self.get_logger().debug("Status: " + " | ".join(parts))
+            # Distance to current waypoint
+            if self.current_waypoint_idx < len(self.planned_path):
+                wp = self.planned_path[self.current_waypoint_idx]
+                dx = wp.pose.position.x - curr_x
+                dy = wp.pose.position.y - curr_y
+                dist = math.hypot(dx, dy)
+                is_final = (self.current_waypoint_idx == len(self.planned_path) - 1)
+                tol = self.waypoint_tolerance / 5.0 if is_final else self.waypoint_tolerance
+                parts.append(f"target=({wp.pose.position.x:.2f},{wp.pose.position.y:.2f})")
+                parts.append(f"dist={dist:.2f}m")
+                if is_final:
+                    parts.append(f"FINAL_WP(tol={tol:.3f}m)")
+            else:
+                parts.append("PATH_COMPLETE")
+
+        self.get_logger().info("Status: " + " | ".join(parts))
 
     def _publish_zero_velocity(self):
         """Stop the drone."""

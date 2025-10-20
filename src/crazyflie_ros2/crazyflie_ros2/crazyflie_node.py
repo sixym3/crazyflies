@@ -18,6 +18,7 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.utils import uri_helper
 
+offset = 0.15
 
 class CrazyflieNode(Node):
     """ROS2 node for Crazyflie control and telemetry (with full TF chain)."""
@@ -304,10 +305,10 @@ class CrazyflieNode(Node):
         stamp = self.get_clock().now().to_msg()
 
         sensors = {
-            'front': data['range.front'],
-            'back':  data['range.back'],
-            'left':  data['range.left'],
-            'right': data['range.right'],
+            'front': data['range.front'] + offset,
+            'back':  data['range.back'] + offset,
+            'left':  data['range.left'] + offset,
+            'right': data['range.right'] + offset,
             'up':    data['range.up'],
             'down':  data['range.zrange']
         }

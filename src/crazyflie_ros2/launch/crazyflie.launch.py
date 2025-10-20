@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch file for Crazyflie node."""
 
 from launch import LaunchDescription

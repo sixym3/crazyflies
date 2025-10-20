@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 D* Lite Path Planning Node for Crazyflie
 
@@ -20,6 +19,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker
 
 import numpy as np
 import math
@@ -346,6 +346,7 @@ class DStarLitePathPlanningNode(Node):
 
         # Publishers
         self.path_pub = self.create_publisher(Path, '/planned_path', 10)
+        self.goal_marker_pub = self.create_publisher(Marker, '/goal_marker', 10)
 
         # Timers
         self.planning_timer = self.create_timer(
@@ -391,6 +392,7 @@ class DStarLitePathPlanningNode(Node):
         self.goal_pose = msg
         self.get_logger().info(
             f'New goal received: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f})')
+        self._publish_goal_marker()
 
     # ----- Planning Loop -----
     def planning_loop(self):
@@ -539,6 +541,42 @@ class DStarLitePathPlanningNode(Node):
             path_msg.poses.append(ps)
 
         self.path_pub.publish(path_msg)
+
+    def _publish_goal_marker(self):
+        """Publish goal marker for visualization in RViz."""
+        if self.goal_pose is None:
+            return
+
+        marker = Marker()
+        marker.header.frame_id = self.goal_pose.header.frame_id if self.goal_pose.header.frame_id else 'world'
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        # Position
+        marker.pose.position.x = self.goal_pose.pose.position.x
+        marker.pose.position.y = self.goal_pose.pose.position.y
+        marker.pose.position.z = self.goal_pose.pose.position.z
+        marker.pose.orientation.w = 1.0
+
+        # Scale (size of sphere)
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+
+        # Color (green)
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 0.8
+
+        # Lifetime (0 = forever)
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 0
+
+        self.goal_marker_pub.publish(marker)
 
 
 def main(args=None):

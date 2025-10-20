@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import csv
 import math
 from collections import deque
@@ -8,6 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Range
+from std_msgs.msg import Bool
 
 # NOTE: don't force a backend; let matplotlib pick a working interactive one.
 import matplotlib.pyplot as plt
@@ -34,13 +34,14 @@ class RangeMonitorNode(Node):
         self.plot_update_hz = float(self.get_parameter('plot_update_hz').value)
         self.log_dir = self.get_parameter('log_dir').get_parameter_value().string_value
 
-        # -------------------- QoS & Subscriber --------------------
+        # -------------------- QoS & Subscribers --------------------
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=50,
         )
         self.sub = self.create_subscription(Range, self.topic, self.range_cb, sensor_qos)
+        self.edge_event_sub = self.create_subscription(Bool, '/perception/edge_event', self.edge_event_cb, 10)
 
         # -------------------- Data Buffers --------------------
         # Absolute time (sec, from ROS clock) + values (m)
@@ -49,6 +50,8 @@ class RangeMonitorNode(Node):
         # For derivative-based z-score
         self.delta_times = deque()   # times for deltas
         self.deltas = deque()        # dr/dt samples
+        # For edge event markers
+        self.edge_event_times = deque()  # timestamps when edge events detected
 
         # -------------------- Plot Setup --------------------
         self.fig, self.ax = plt.subplots(figsize=(10, 6))
@@ -63,26 +66,31 @@ class RangeMonitorNode(Node):
         # Show threshold/expected height as reference
         self.exp_height_line = self.ax.axhline(self.expected_height, linestyle='--', linewidth=1)
 
+        # Edge event vertical lines (will be updated in plot loop)
+        self.edge_lines = []
+
         # Text readouts
         self.text_info = self.ax.text(
             0.02, 0.95, '', transform=self.ax.transAxes, va='top', ha='left'
         )
 
-        # -------------------- CSV Logging --------------------
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.csv_path = f'{self.log_dir}/range_down_log_{ts}.csv'
-        self.csv_file = open(self.csv_path, 'w', newline='')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow([
-            'time_ns',
-            'time_iso',
-            'range_m',
-            'height_err_m',      # range - expected_height
-            'delta_m_per_s',     # derivative estimate
-            'zscore_delta',
-            'edge_flag'          # 1 if |z| >= threshold else 0
-        ])
-        self.get_logger().info(f'Logging to {self.csv_path}')
+        # -------------------- CSV Logging (DISABLED) --------------------
+        # ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        # self.csv_path = f'{self.log_dir}/range_down_log_{ts}.csv'
+        # self.csv_file = open(self.csv_path, 'w', newline='')
+        # self.csv_writer = csv.writer(self.csv_file)
+        # self.csv_writer.writerow([
+        #     'time_ns',
+        #     'time_iso',
+        #     'range_m',
+        #     'height_err_m',      # range - expected_height
+        #     'delta_m_per_s',     # derivative estimate
+        #     'zscore_delta',
+        #     'edge_flag'          # 1 if |z| >= threshold else 0
+        # ])
+        # self.get_logger().info(f'Logging to {self.csv_path}')
+        self.csv_file = None
+        self.csv_writer = None
 
         # -------------------- Timers --------------------
         # Plot update timer
@@ -140,11 +148,11 @@ class RangeMonitorNode(Node):
             z = 0.0
             edge_flag = 0
 
-        # Log CSV
-        time_ns = self.get_clock().now().nanoseconds
-        time_iso = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
-        height_err = r - self.expected_height
-        self.csv_writer.writerow([time_ns, time_iso, f'{r:.6f}', f'{height_err:.6f}', f'{drdt:.6f}', f'{z:.6f}', edge_flag])
+        # Log CSV (DISABLED)
+        # time_ns = self.get_clock().now().nanoseconds
+        # time_iso = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+        # height_err = r - self.expected_height
+        # self.csv_writer.writerow([time_ns, time_iso, f'{r:.6f}', f'{height_err:.6f}', f'{drdt:.6f}', f'{z:.6f}', edge_flag])
 
         # Optional console log when we think we hit an edge
         if edge_flag:
@@ -153,7 +161,7 @@ class RangeMonitorNode(Node):
             )
 
     def prune_old_data(self):
-        # keep only last time_window seconds in (times, values)
+        # keep only last time_window seconds in (times, values, edge_event_times)
         if not self.times:
             return
         current_time = self.times[-1][0]
@@ -162,6 +170,15 @@ class RangeMonitorNode(Node):
             self.times.popleft()
         while self.values and self.values[0][0] < cutoff:
             self.values.popleft()
+        while self.edge_event_times and self.edge_event_times[0] < cutoff:
+            self.edge_event_times.popleft()
+
+    def edge_event_cb(self, msg: Bool):
+        """Handle edge event detection from range_edge_detector_node."""
+        if msg.data:
+            t = self.now_sec()
+            self.edge_event_times.append(t)
+            self.get_logger().info(f'Edge event received at t={t:.3f}s')
 
     @staticmethod
     def mean_std_from(dq_of_pairs):
@@ -200,6 +217,17 @@ class RangeMonitorNode(Node):
             hi = lo + 0.1
         self.ax.set_ylim(lo, hi)
 
+        # Remove old edge event lines
+        for line in self.edge_lines:
+            line.remove()
+        self.edge_lines.clear()
+
+        # Draw vertical lines for edge events
+        for edge_t in self.edge_event_times:
+            x_pos = edge_t - current_time  # seconds ago
+            line = self.ax.axvline(x_pos, color='red', linestyle='--', linewidth=2, alpha=0.7)
+            self.edge_lines.append(line)
+
         # annotate status
         last_range = ys[-1]
         _, last_drdt = (self.deltas[-1] if self.deltas else (current_time, 0.0))
@@ -209,7 +237,8 @@ class RangeMonitorNode(Node):
             f'range: {last_range:.3f} m   '
             f'Δrange: {last_drdt:.3f} m/s   '
             f'z(Δ): {z:.2f}   '
-            f'edges @ |z| ≥ {self.z_thresh:g}'
+            f'edges @ |z| ≥ {self.z_thresh:g}   '
+            f'edge events: {len(self.edge_event_times)}'
         )
 
         self.fig.canvas.draw()
@@ -219,8 +248,9 @@ class RangeMonitorNode(Node):
     # -------------------- Shutdown --------------------
     def destroy_node(self):
         try:
-            self.csv_file.flush()
-            self.csv_file.close()
+            if self.csv_file:
+                self.csv_file.flush()
+                self.csv_file.close()
         except Exception:
             pass
         return super().destroy_node()

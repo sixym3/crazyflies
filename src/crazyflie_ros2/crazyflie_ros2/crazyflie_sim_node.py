@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ROS2 Crazyflie Simulation Node (updated to mirror crazyflie_node.py TF chain)
 

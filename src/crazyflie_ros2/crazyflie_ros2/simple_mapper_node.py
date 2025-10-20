@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 """ This simple mapper is loosely based on both the bitcraze cflib point cloud example
  https://github.com/bitcraze/crazyflie-lib-python/blob/master/examples/multiranger/multiranger_pointcloud.py
  and the webots epuck simple mapper example:
@@ -28,8 +26,9 @@ class SimpleMapperMultiranger(Node):
 
         # Declare parameters
         self.declare_parameter('robot_prefix', '/crazyflie')
-        self.declare_parameter('avoidance_distance', 0.5)  # meters
+        self.declare_parameter('avoidance_distance', 0.6)  # meters (increased from 0.5 to stay 0.1m further from obstacles)
         self.declare_parameter('max_avoidance_weight', 50)  # 1-50 range for weights
+        self.declare_parameter('max_obstacle_range', 1.0)  # meters - ignore obstacles beyond this distance
 
         # Map size and origin parameters (Option B: extends in +X direction)
         self.declare_parameter('map_size_x', 40.0)  # meters (default 40m, was 20m)
@@ -42,6 +41,7 @@ class SimpleMapperMultiranger(Node):
         robot_prefix = self.get_parameter('robot_prefix').value
         self.avoidance_distance = self.get_parameter('avoidance_distance').value
         self.max_avoidance_weight = self.get_parameter('max_avoidance_weight').value
+        self.max_obstacle_range = self.get_parameter('max_obstacle_range').value
 
         # Map configuration
         self.map_size_x = self.get_parameter('map_size_x').value
@@ -90,6 +90,8 @@ class SimpleMapperMultiranger(Node):
                                f"resolution: {self.map_resolution}m")
         self.get_logger().info(f"Avoidance distance: {self.avoidance_distance}m, "
                                f"max weight: {self.max_avoidance_weight}")
+        self.get_logger().info(f"Max obstacle range: {self.max_obstacle_range}m "
+                               f"(obstacles beyond this distance will be ignored)")
         self.publish_initial_map()
 
     def publish_initial_map(self):
@@ -293,19 +295,19 @@ class SimpleMapperMultiranger(Node):
         self.get_logger().debug(f"Ranges - back: {r_back}, right: {r_right}, front: {r_front}, left: {r_left}, max: {self.range_max}")
 
 
-        if (r_left < self.range_max and r_left != 0.0 and math.isinf(r_left) == False):
+        if (r_left < self.range_max and r_left != 0.0 and math.isinf(r_left) == False and r_left < self.max_obstacle_range):
             left = [o[0], o[1] + r_left, o[2]]
             data.append(self.rot(roll, pitch, yaw, o, left))
 
-        if (r_right < self.range_max and r_right != 0.0 and math.isinf(r_right) == False):
+        if (r_right < self.range_max and r_right != 0.0 and math.isinf(r_right) == False and r_right < self.max_obstacle_range):
             right = [o[0], o[1] - r_right, o[2]]
             data.append(self.rot(roll, pitch, yaw, o, right))
 
-        if (r_front < self.range_max and r_front != 0.0 and math.isinf(r_front) == False):
+        if (r_front < self.range_max and r_front != 0.0 and math.isinf(r_front) == False and r_front < self.max_obstacle_range):
             front = [o[0] + r_front, o[1], o[2]]
             data.append(self.rot(roll, pitch, yaw, o, front))
 
-        if (r_back < self.range_max and r_back != 0.0 and math.isinf(r_back) == False):
+        if (r_back < self.range_max and r_back != 0.0 and math.isinf(r_back) == False and r_back < self.max_obstacle_range):
             back = [o[0] - r_back, o[1], o[2]]
             data.append(self.rot(roll, pitch, yaw, o, back))
 

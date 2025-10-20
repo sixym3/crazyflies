@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch file for Crazyflie hardware with mapper, D* Lite planning, and FSM navigation."""
 
 from launch import LaunchDescription
@@ -20,13 +19,13 @@ def generate_launch_description():
         description='Path planning frequency in Hz (lower = less oscillation)')
 
     flight_height_arg = DeclareLaunchArgument(
-        'flight_height', default_value='0.5',
+        'flight_height', default_value='0.35',
         description='Flight height in meters')
 
     # Mapper parameters
     avoidance_distance_arg = DeclareLaunchArgument(
-        'avoidance_distance', default_value='0.8',
-        description='Avoidance distance from obstacles in meters')
+        'avoidance_distance', default_value='0.9',
+        description='Avoidance distance from obstacles in meters (increased by 0.1m)')
 
     max_avoidance_weight_arg = DeclareLaunchArgument(
         'max_avoidance_weight', default_value='50',
@@ -60,7 +59,7 @@ def generate_launch_description():
             parameters=[{
                 'uri': uri,
                 'hover_height': flight_height,
-                'speed_factor': 0.3,
+                'speed_factor': 0.2,
                 'logging_only': False,
                 'map_frame': 'map',
                 'world_frame': 'world',
@@ -126,8 +125,8 @@ def generate_launch_description():
             arguments=['--ros-args', '--log-level', f'range_edge_detector_node:={log_level}'],
             parameters=[{
                 'topic': '/crazyflie/range/down',
-                'window': 20,
-                'z_thresh': 3.8,
+                'window': 10,
+                'z_thresh': 2.8,
                 'expected_height_m': flight_height,
                 'log_csv': True,
                 'log_dir': 'logs'
@@ -145,7 +144,7 @@ def generate_launch_description():
                 'altitude_tolerance': 0.05,
                 'edge_detection_delay': 2.0,
                 'landing_descent_rate': 0.01,
-                'min_landing_height': 0.12,
+                'min_landing_height': 0.05,
             }]
         )
 
@@ -162,8 +161,10 @@ def generate_launch_description():
                 'search_step_m': 0.15,
                 'max_descent_rate': 0.08,
                 'min_hover_height': 0.12,
-                'min_edge_points': 3,
+                'min_edge_points': 20,
                 'goal_tolerance': 0.15,
+                'box_landing_speed': 1.0,
+                'search_scale': 1.0,
             }]
         )
 

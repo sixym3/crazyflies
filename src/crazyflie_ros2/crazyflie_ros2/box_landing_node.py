@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import math, numpy as np
 import rclpy
 from rclpy.node import Node
@@ -17,8 +16,10 @@ class BoxLandingNode(Node):
         self.declare_parameter('search_step_m', 0.15)
         self.declare_parameter('max_descent_rate', 0.08)
         self.declare_parameter('min_hover_height', 0.12)
-        self.declare_parameter('min_edge_points', 3)
+        self.declare_parameter('min_edge_points', 20)
         self.declare_parameter('goal_tolerance', 0.15)
+        self.declare_parameter('box_landing_speed', 1.0)
+        self.declare_parameter('search_scale', 1.0)
 
         self.enabled = bool(self.get_parameter('enabled').value)
         self.flight_height = float(self.get_parameter('flight_height').value)
@@ -28,13 +29,21 @@ class BoxLandingNode(Node):
         self.min_hover = float(self.get_parameter('min_hover_height').value)
         self.min_edge_points = int(self.get_parameter('min_edge_points').value)
         self.goal_tolerance = float(self.get_parameter('goal_tolerance').value)
+        self.box_landing_speed = float(self.get_parameter('box_landing_speed').value)
+        self.search_scale = float(self.get_parameter('search_scale').value)
 
         # State
         self.pose = None
-        self.phase = 'IDLE'      # IDLE -> SCAN -> NAVIGATE -> DESCEND -> STOP
-        self.scan_targets = []
+        self.pose_history = []  # Track last few poses for velocity calculation
+        self.phase = 'IDLE'      # IDLE -> GRID_SEARCH -> NAVIGATE -> WAIT_COMPLETE -> STOP
         self.edge_points = []  # List of (x, y) positions where edges detected
         self.box_centroid = None
+        self.wait_start_time = None
+
+        # Grid search state
+        self.grid_center = None  # (x, y) position where first edge detected
+        self.grid_sequence = []  # List of (vx_unit, vy_unit, duration) velocity commands
+        self.grid_start_time = None
 
         # IO
         self.pose_sub = self.create_subscription(PoseStamped, '/crazyflie/pose', self.pose_cb, 10)
@@ -62,18 +71,38 @@ class BoxLandingNode(Node):
         res.message = f'box_landing_node {"enabled" if self.enabled else "disabled"}'
         self.get_logger().info(res.message)
         if self.enabled:
-            self.phase = 'SCAN'
-            self._publish_status('searching')
-            self.plan_scan_targets()
+            # Clear state
             self.edge_points.clear()
             self.box_centroid = None
-            self.get_logger().info(f'Starting box landing sequence - SCAN phase initiated')
-            self.get_logger().info(f'Generated {len(self.scan_targets)} scan waypoints in lawnmower pattern')
-            self.get_logger().info(f'Listening for edge events - need {self.min_edge_points} minimum')
+            self.grid_center = None
+            self.grid_sequence = []
+            self.grid_start_time = None
+
+            # Immediately start grid search using current position as first edge
+            if self.pose is not None:
+                x = self.pose.pose.position.x
+                y = self.pose.pose.position.y
+                self.edge_points.append((x, y))
+                self.get_logger().info(
+                    f'Box landing enabled - using current position as EDGE POINT #1: ({x:.3f}, {y:.3f})')
+                self.grid_center = (x, y)
+                # self.grid_center = self._apply_direction_offset(self.grid_center, 0.15)  # Comment out to disable offset
+                self.grid_sequence = self._generate_grid_sequence()
+                self.grid_start_time = self.get_clock().now().nanoseconds / 1e9
+                self.phase = 'GRID_SEARCH'
+                self._publish_status('grid_searching')
+                total_duration = sum(seg[2] for seg in self.grid_sequence)
+                self.get_logger().info(
+                    f'Starting grid search immediately - center at ({self.grid_center[0]:.3f}, {self.grid_center[1]:.3f}), '
+                    f'{len(self.grid_sequence)} movements, total duration={total_duration:.1f}s')
+            else:
+                self.get_logger().warn('Box landing enabled but no pose available yet - waiting')
+                self.phase = 'IDLE'
+                self._publish_status('waiting_for_pose')
         else:
             self.phase = 'IDLE'
             self.cmd_pub.publish(Twist())
-            self._call_autonomous_nav(False)  # Make sure autonomous nav is disabled
+            # Note: mode_manager handles enabling/disabling autonomous nav
             self.get_logger().info('Box landing disabled - stopping')
         return res
 
@@ -85,6 +114,13 @@ class BoxLandingNode(Node):
 
     def pose_cb(self, msg):
         was_none = self.pose is None
+
+        # Track pose history for velocity calculation (keep last 10 poses)
+        if self.pose is not None:
+            self.pose_history.append(self.pose)
+            if len(self.pose_history) > 10:
+                self.pose_history.pop(0)
+
         self.pose = msg
         if was_none:
             self.get_logger().info(
@@ -92,23 +128,162 @@ class BoxLandingNode(Node):
                 f'{msg.pose.position.y:.2f}, {msg.pose.position.z:.2f})')
 
     def edge_cb(self, msg: Bool):
-        """Handle edge detection events - record position when edge detected."""
+        """Handle edge detection events - record position when edge detected during GRID_SEARCH."""
         if not msg.data or not self.enabled or self.pose is None:
             return
 
-        # Only record edges during SCAN phase
-        if self.phase == 'SCAN':
+        # Only record edges during GRID_SEARCH phase
+        if self.phase == 'GRID_SEARCH':
             x = self.pose.pose.position.x
             y = self.pose.pose.position.y
             self.edge_points.append((x, y))
             self.get_logger().info(
                 f'EDGE POINT #{len(self.edge_points)} recorded at ({x:.3f}, {y:.3f})')
 
-            # Check if we have enough points
+            # Check if we have enough points to stop grid search
             if len(self.edge_points) >= self.min_edge_points:
                 self.get_logger().info(
-                    f'Collected {len(self.edge_points)} edge points - computing centroid')
+                    f'Collected {len(self.edge_points)} edge points (>= {self.min_edge_points}) - stopping grid search')
                 self._compute_and_navigate_to_centroid()
+
+    def _generate_grid_sequence(self):
+        """
+        Generate velocity sequence for two perpendicular raster/lawnmower grid patterns.
+        First pattern: horizontal sweeps (left-right), moving down between rows.
+        Second pattern: vertical sweeps (up-down), moving right between columns.
+        Grid is centered at drone's current position (grid_center), extends ±search_span/2,
+        with spacing of search_step.
+        Returns list of (vx_unit, vy_unit, duration) tuples.
+        """
+        if self.grid_center is None:
+            self.get_logger().error('Cannot generate grid: grid_center is None')
+            return []
+
+        half_span = self.search_span / 2.0
+        step = self.search_step
+
+        # Calculate number of rows and columns
+        num_cols = int(self.search_span / step) + 1
+        num_rows = int(self.search_span / step) + 1
+
+        # Calculate duration for each segment based on step distance and speed
+        # duration = distance / speed
+        horizontal_duration = step / self.box_landing_speed * self.search_scale
+        vertical_duration = step / self.box_landing_speed * self.search_scale
+
+        sequence = []
+
+        # Start at center, move to top-left corner of grid
+        # Move up (positive Y)
+        move_up = half_span / self.box_landing_speed * self.search_scale
+        sequence.append((0.0, 1.0, move_up))
+
+        # Move left (negative X)
+        move_left = half_span / self.box_landing_speed * self.search_scale
+        sequence.append((-1.0, 0.0, move_left))
+
+        # HORIZONTAL RASTER PATTERN: sweep right/left on each row, move down between rows
+        for row in range(num_rows):
+            if row % 2 == 0:
+                # Even row: move right across entire span
+                sequence.append((1.0, 0.0, self.search_span / self.box_landing_speed * self.search_scale))
+            else:
+                # Odd row: move left across entire span
+                sequence.append((-1.0, 0.0, self.search_span / self.box_landing_speed * self.search_scale))
+
+            # Move down to next row (unless it's the last row)
+            if row < num_rows - 1:
+                sequence.append((0.0, -1.0, vertical_duration))
+
+        # After horizontal pattern, position depends on num_rows
+        # If last row index (num_rows-1) is even, we're at bottom-right, need to move left
+        # If last row index is odd, we're at bottom-left, already positioned
+        if (num_rows - 1) % 2 == 0:
+            # Ended at bottom-right, move to bottom-left
+            sequence.append((-1.0, 0.0, self.search_span / self.box_landing_speed * self.search_scale))
+
+        # PERPENDICULAR RASTER PATTERN: sweep up/down on each column, move right between columns
+        for col in range(num_cols):
+            if col % 2 == 0:
+                # Even column: move up across entire span
+                sequence.append((0.0, 1.0, self.search_span / self.box_landing_speed * self.search_scale))
+            else:
+                # Odd column: move down across entire span
+                sequence.append((0.0, -1.0, self.search_span / self.box_landing_speed * self.search_scale))
+
+            # Move right to next column (unless it's the last column)
+            if col < num_cols - 1:
+                sequence.append((1.0, 0.0, horizontal_duration))
+
+        return sequence
+
+    def _apply_direction_offset(self, position: tuple, offset_distance: float) -> tuple:
+        """
+        Offset a position by a distance in the direction the drone was traveling.
+        Calculates velocity from recent pose history.
+        Returns new (x, y) position offset in the travel direction.
+        """
+        if self.pose is None or len(self.pose_history) < 2:
+            self.get_logger().warn('Cannot apply direction offset: insufficient pose history')
+            return position
+
+        # Calculate velocity from pose history (use last few poses for better estimate)
+        # Get timestamps and positions
+        recent_poses = self.pose_history[-5:] if len(self.pose_history) >= 5 else self.pose_history
+        if len(recent_poses) < 2:
+            self.get_logger().warn('Cannot apply direction offset: insufficient recent poses')
+            return position
+
+        # Calculate average velocity from pose differences
+        dx_total = 0.0
+        dy_total = 0.0
+        dt_total = 0.0
+
+        for i in range(len(recent_poses) - 1):
+            p1 = recent_poses[i]
+            p2 = recent_poses[i + 1]
+
+            # Time difference
+            t1 = p1.header.stamp.sec + p1.header.stamp.nanosec / 1e9
+            t2 = p2.header.stamp.sec + p2.header.stamp.nanosec / 1e9
+            dt = t2 - t1
+
+            if dt > 1e-6:  # Valid time difference
+                dx = p2.pose.position.x - p1.pose.position.x
+                dy = p2.pose.position.y - p1.pose.position.y
+                dx_total += dx
+                dy_total += dy
+                dt_total += dt
+
+        if dt_total < 1e-6:
+            self.get_logger().warn('Cannot apply direction offset: zero time interval')
+            return position
+
+        # Calculate velocity in world frame
+        vx_world = dx_total / dt_total
+        vy_world = dy_total / dt_total
+
+        # Normalize direction vector
+        magnitude = math.sqrt(vx_world**2 + vy_world**2)
+        if magnitude < 1e-6:
+            self.get_logger().warn('Cannot apply direction offset: zero velocity')
+            return position
+
+        dir_x = vx_world / magnitude
+        dir_y = vy_world / magnitude
+
+        # Apply offset
+        new_x = position[0] + dir_x * offset_distance
+        new_y = position[1] + dir_y * offset_distance
+
+        self.get_logger().info(
+            f'Direction offset: original=({position[0]:.3f}, {position[1]:.3f}), '
+            f'direction=({dir_x:.3f}, {dir_y:.3f}), '
+            f'velocity=({vx_world:.3f}, {vy_world:.3f}) m/s, '
+            f'offset={offset_distance:.3f}m, '
+            f'new=({new_x:.3f}, {new_y:.3f})')
+
+        return (new_x, new_y)
 
     def _call_autonomous_nav(self, enable: bool):
         """Enable/disable autonomous navigation node."""
@@ -125,7 +300,7 @@ class BoxLandingNode(Node):
 
     def _compute_and_navigate_to_centroid(self):
         """Compute box centroid from edge points and navigate to it."""
-        if len(self.edge_points) < self.min_edge_points:
+        if len(self.edge_points) < 3:
             self.get_logger().warn(
                 f'Not enough edge points: {len(self.edge_points)} < {self.min_edge_points}')
             return
@@ -159,82 +334,79 @@ class BoxLandingNode(Node):
         self._publish_status('navigating')
         self.get_logger().info('Transitioning to NAVIGATE phase - autonomous navigation enabled')
 
-    # --- simple local lawnmower around current position (in WORLD XY) ---
-    def plan_scan_targets(self):
-        if not self.pose:
-            self.scan_targets = []
-            self.get_logger().warn('Cannot plan scan targets - no pose data')
-            return
-        x0 = self.pose.pose.position.x
-        y0 = self.pose.pose.position.y
-        span = self.search_span
-        step = self.search_step
-        targets = []
-        y = -span
-        toggle = False
-        while y <= span + 1e-6:
-            xs = np.arange(-span, span + 1e-6, step)
-            if toggle: xs = xs[::-1]
-            for dx in xs:
-                targets.append((x0 + dx, y0 + y))
-            y += step
-            toggle = not toggle
-        self.scan_targets = targets
-        self.get_logger().info(
-            f'Scan pattern: {len(targets)} waypoints in {span*2:.1f}m x {span*2:.1f}m area, '
-            f'step={step:.2f}m, centered at ({x0:.2f}, {y0:.2f})')
-
     def loop(self):
         if not self.enabled or self.pose is None:
             return
 
-        if self.phase == 'SCAN':
-            # Execute lawnmower scan pattern
-            # Edges are detected via edge_cb callback
-            if not self.scan_targets:
-                # Scan pattern complete but not enough edges yet
-                self.get_logger().warn(
-                    f'SCAN: Scan pattern complete but only {len(self.edge_points)} edges detected '
-                    f'(need {self.min_edge_points}). Waiting for more edges or manual intervention.')
-                # Just hover and wait for more edges
+        if self.phase == 'GRID_SEARCH':
+            # Execute time-based velocity sequence for grid pattern
+            # Edges detected via edge_cb will stop this early if min_edge_points reached
+            if self.grid_start_time is None:
+                self.get_logger().warn('GRID_SEARCH: No start time set')
+                return
+
+            if not self.grid_sequence:
+                self.get_logger().error('GRID_SEARCH: No sequence available!')
+                self.phase = 'WAIT_COMPLETE'
+                self._publish_status('completed')
+                self.wait_start_time = self.get_clock().now().nanoseconds / 1e9
                 self.cmd_pub.publish(Twist())
                 return
 
-            # Navigate to next scan waypoint
-            tx, ty = self.scan_targets[0]
-            cx = self.pose.pose.position.x
-            cy = self.pose.pose.position.y
-            dx, dy = (tx - cx), (ty - cy)
-            dist = math.hypot(dx, dy)
-
-            # Check if reached waypoint
-            if dist < 0.06:
-                self.scan_targets.pop(0)
-                self.get_logger().info(
-                    f'SCAN: Waypoint reached - {len(self.scan_targets)} remaining, '
-                    f'{len(self.edge_points)} edges detected')
-
-            # Move toward waypoint
-            v = Twist()
-            if dist > 1e-3:
-                ux, uy = dx / max(dist, 1e-6), dy / max(dist, 1e-6)
-                v.linear.x = 0.2 * ux
-                v.linear.y = 0.2 * uy
-            # Hold altitude
-            zerr = self.flight_height - self.pose.pose.position.z
-            v.linear.z = max(min(1.0 * zerr, 0.2), -0.2)
-            v.angular.z = 0.0
+            elapsed = self.get_clock().now().nanoseconds / 1e9 - self.grid_start_time
+            total_duration = sum(seg[2] for seg in self.grid_sequence)
 
             # Log progress periodically
-            if not hasattr(self, '_scan_log_count'):
-                self._scan_log_count = 0
-            self._scan_log_count += 1
-            if self._scan_log_count % 30 == 0:  # Every 3 seconds
+            if not hasattr(self, '_grid_log_count'):
+                self._grid_log_count = 0
+            self._grid_log_count += 1
+            if self._grid_log_count % 20 == 0:  # Every 2 seconds
                 self.get_logger().info(
-                    f'SCAN: Target ({tx:.2f}, {ty:.2f}), dist={dist:.3f}m, '
-                    f'edges={len(self.edge_points)}, waypoints_left={len(self.scan_targets)}')
+                    f'GRID_SEARCH: elapsed={elapsed:.1f}s/{total_duration:.1f}s, edges={len(self.edge_points)}')
 
-            self.cmd_pub.publish(v)
+            # Check if sequence complete
+            if elapsed >= total_duration:
+                self.get_logger().info(
+                    f'GRID_SEARCH: Sequence complete - {len(self.edge_points)} edges detected')
+
+                # Check if we have enough edges to attempt navigation
+                if len(self.edge_points) >= 3:
+                    if len(self.edge_points) >= self.min_edge_points:
+                        self.get_logger().info(
+                            f'Sufficient edges collected ({len(self.edge_points)} >= {self.min_edge_points})')
+                    else:
+                        self.get_logger().warn(
+                            f'Only {len(self.edge_points)} edges collected (target: {self.min_edge_points}), '
+                            f'but attempting navigation with available points')
+                    self._compute_and_navigate_to_centroid()
+                else:
+                    self.get_logger().warn(
+                        f'Insufficient edges for navigation: {len(self.edge_points)} < 3 (minimum required)')
+                    self.phase = 'WAIT_COMPLETE'
+                    self._publish_status('completed')
+                    self.wait_start_time = self.get_clock().now().nanoseconds / 1e9
+                    self.cmd_pub.publish(Twist())
+                return
+
+            # Find current segment in sequence
+            cumulative_time = 0.0
+            for vx_unit, vy_unit, duration in self.grid_sequence:
+                if elapsed < cumulative_time + duration:
+                    v = Twist()
+                    # Apply speed scaling to unit vectors
+                    v.linear.x = vx_unit * self.box_landing_speed
+                    v.linear.y = vy_unit * self.box_landing_speed
+                    # Altitude hold
+                    if self.pose:
+                        zerr = self.flight_height - self.pose.pose.position.z
+                        v.linear.z = max(min(1.0 * zerr, 0.2), -0.2)
+                    v.angular.z = 0.0
+                    self.cmd_pub.publish(v)
+                    return
+                cumulative_time += duration
+
+            # Shouldn't reach here, but publish stop just in case
+            self.cmd_pub.publish(Twist())
             return
 
         if self.phase == 'NAVIGATE':
@@ -265,42 +437,30 @@ class BoxLandingNode(Node):
                 # Disable autonomous navigation
                 self._call_autonomous_nav(False)
 
-                # Transition to DESCEND
-                self.phase = 'DESCEND'
-                self._publish_status('descending')
-                self.get_logger().info(f'Transitioning to DESCEND - landing from z={self.pose.pose.position.z:.3f}m')
+                # Transition to WAIT_COMPLETE (hover for 1 second before delegating back)
+                self.phase = 'WAIT_COMPLETE'
+                self._publish_status('completing')
+                self.wait_start_time = self.get_clock().now().nanoseconds / 1e9
+                self.cmd_pub.publish(Twist())  # Stop moving
+                self.get_logger().info(f'Transitioning to WAIT_COMPLETE - hovering for 1 second')
             return
 
-        if self.phase == 'DESCEND':
-            # Direct landing
-            v = Twist()
-            v.linear.x = 0.0
-            v.linear.y = 0.0
-            v.linear.z = -self.vz_max
-            v.angular.z = 0.0
-            self.cmd_pub.publish(v)
+        if self.phase == 'WAIT_COMPLETE':
+            # Hover for 1 second before delegating back to mode_manager
+            if self.wait_start_time is None:
+                self.get_logger().warn('WAIT_COMPLETE: No wait start time set')
+                return
 
-            z = self.pose.pose.position.z
+            elapsed = self.get_clock().now().nanoseconds / 1e9 - self.wait_start_time
 
-            # Log descent progress periodically
-            if not hasattr(self, '_descend_log_count'):
-                self._descend_log_count = 0
-            self._descend_log_count += 1
-            if self._descend_log_count % 10 == 0:  # Every 1 second
-                self.get_logger().info(
-                    f'DESCEND: altitude={z:.3f}m, target={self.min_hover:.3f}m, '
-                    f'descent_rate={self.vz_max:.3f}m/s')
+            # Continue hovering
+            self.cmd_pub.publish(Twist())
 
-            # Check if landing complete
-            if z <= (self.min_hover + 0.02):
-                self.get_logger().info(
-                    f'DESCEND: Landing complete at z={z:.3f}m – sending emergency stop')
-                self.cmd_pub.publish(Twist())
-                estop = Bool()
-                estop.data = True
-                self.estop_pub.publish(estop)
-                self.phase = 'STOP'
+            # Check if wait period complete
+            if elapsed >= 1.0:
+                self.get_logger().info('WAIT_COMPLETE: 1 second elapsed - delegating back to mode_manager')
                 self._publish_status('completed')
+                self.phase = 'STOP'
                 self.enabled = False
                 self.get_logger().info('Box landing sequence complete!')
             return

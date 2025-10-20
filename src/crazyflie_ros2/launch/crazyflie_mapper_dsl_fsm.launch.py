@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch file for Crazyflie hardware with mapper, D* Lite planning, and FSM navigation."""
 
 from launch import LaunchDescription
@@ -25,8 +24,8 @@ def generate_launch_description():
 
     # Mapper parameters
     avoidance_distance_arg = DeclareLaunchArgument(
-        'avoidance_distance', default_value='0.8',
-        description='Avoidance distance from obstacles in meters')
+        'avoidance_distance', default_value='0.9',
+        description='Avoidance distance from obstacles in meters (increased by 0.1m)')
 
     max_avoidance_weight_arg = DeclareLaunchArgument(
         'max_avoidance_weight', default_value='50',

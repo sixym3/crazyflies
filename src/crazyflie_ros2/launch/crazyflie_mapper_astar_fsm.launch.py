@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
@@ -36,7 +35,7 @@ def generate_launch_description():
             arguments=['--ros-args', '--log-level', f'simple_mapper_node:={log_level}'],
             parameters=[{
                 'robot_prefix': '/crazyflie',
-                'avoidance_distance': 0.5,     # meters
+                'avoidance_distance': 0.6,     # meters (increased by 0.1m)
                 'max_avoidance_weight': 50,    # 1-50 range
                 # Map configuration (Option B: extends in +X direction)
                 'map_size_x': 40.0,           # meters (40m x 20m map)

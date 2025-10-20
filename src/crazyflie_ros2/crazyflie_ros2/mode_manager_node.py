@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Mode Manager Node for Crazyflie Mission Control
 
@@ -11,6 +10,7 @@ States:
   - NAVIGATION: Path following to goal
   - BOX_LANDING: Precision landing on detected box
   - LAND: Emergency landing sequence
+  - WAITING: Post-landing, waiting for REFLY command
 
 Subscribes to:
   /crazyflie/pose (geometry_msgs/PoseStamped)
@@ -22,6 +22,9 @@ Service Clients:
   /enable_autonomous (std_srvs/SetBool) - controls autonomous_navigation_node
   /enable_box_landing (std_srvs/SetBool) - controls box_landing_node
 
+Service Servers:
+  /refly (std_srvs/Trigger) - returns to IDLE state for new mission
+
 Publishes:
   /crazyflie/emergency_stop (std_msgs/Bool)
   /mode_manager/state (std_msgs/String)
@@ -31,7 +34,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import Bool, String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 
 
 class ModeManagerNode(Node):
@@ -43,7 +46,7 @@ class ModeManagerNode(Node):
         # Parameters
         self.declare_parameter('flight_height', 0.5)
         self.declare_parameter('altitude_tolerance', 0.05)
-        self.declare_parameter('edge_detection_delay', 2.0)
+        self.declare_parameter('edge_detection_delay', 5.0)
         self.declare_parameter('landing_descent_rate', 0.01)  # m per control cycle
         self.declare_parameter('min_landing_height', 0.12)
 
@@ -59,6 +62,10 @@ class ModeManagerNode(Node):
         self.goal_pose = None
         self.navigation_start_time = None
         self.current_landing_height = self.flight_height
+
+        # Track node enabled states to avoid redundant service calls
+        self.autonomous_nav_enabled = False
+        self.box_landing_enabled = False
 
         # Subscribers
         self.pose_sub = self.create_subscription(
@@ -78,6 +85,9 @@ class ModeManagerNode(Node):
         # Service clients
         self.autonomous_nav_client = self.create_client(SetBool, '/enable_autonomous')
         self.box_landing_client = self.create_client(SetBool, '/enable_box_landing')
+
+        # Service servers
+        self.refly_service = self.create_service(Trigger, '/refly', self.refly_callback)
 
         # Timers
         self.control_timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
@@ -125,8 +135,21 @@ class ModeManagerNode(Node):
     def box_landing_status_callback(self, msg: String):
         """Handle status updates from box landing node."""
         if msg.data == 'completed' and self.state == 'BOX_LANDING':
-            self.get_logger().info('Box landing completed → STATE CHANGE: BOX_LANDING -> IDLE')
+            self.get_logger().info('Box landing completed → STATE CHANGE: BOX_LANDING -> LAND')
+            self._change_state('LAND')
+
+    def refly_callback(self, request: Trigger.Request, response: Trigger.Response):
+        """Handle REFLY service call to restart mission."""
+        if self.state == 'WAITING':
+            self.get_logger().info('REFLY service called → STATE CHANGE: WAITING -> IDLE')
             self._change_state('IDLE')
+            response.success = True
+            response.message = 'Transitioning to IDLE state'
+        else:
+            self.get_logger().warn(f'REFLY service called in {self.state} state, expected WAITING')
+            response.success = False
+            response.message = f'Cannot REFLY from {self.state} state'
+        return response
 
     # ----- State Management -----
     def _change_state(self, new_state: str):
@@ -142,33 +165,60 @@ class ModeManagerNode(Node):
         state_msg.data = new_state
         self.state_pub.publish(state_msg)
 
-        # Handle state transitions
+        # Handle state transitions - only enable/disable specific nodes as needed
         if new_state == 'TAKEOFF':
-            self._disable_all_control_nodes()
+            # Only disable all nodes at start of flight (from IDLE)
+            if old_state == 'IDLE':
+                self._disable_all_control_nodes()
             # Takeoff is handled directly in control_loop via cmd_vel
 
         elif new_state == 'NAVIGATION':
-            self._disable_all_control_nodes()
+            # Disable box_landing if coming from BOX_LANDING
+            if old_state == 'BOX_LANDING':
+                self._enable_box_landing(False)
+            # Enable autonomous navigation
             self._enable_autonomous_navigation(True)
             self.navigation_start_time = self.get_clock().now().nanoseconds / 1e9
 
         elif new_state == 'BOX_LANDING':
-            self._disable_all_control_nodes()
+            # Disable autonomous navigation if coming from NAVIGATION
+            if old_state == 'NAVIGATION':
+                self._enable_autonomous_navigation(False)
+            # Enable box landing
             self._enable_box_landing(True)
 
         elif new_state == 'LAND':
-            self._disable_all_control_nodes()
+            # Disable whichever node was active
+            if old_state == 'NAVIGATION':
+                self._enable_autonomous_navigation(False)
+            elif old_state == 'BOX_LANDING':
+                self._enable_box_landing(False)
             self.current_landing_height = self.flight_height
             # Landing is handled directly in control_loop via cmd_vel
 
         elif new_state == 'IDLE':
-            self._disable_all_control_nodes()
+            # Disable whichever node was active
+            if old_state == 'NAVIGATION':
+                self._enable_autonomous_navigation(False)
+            elif old_state == 'BOX_LANDING':
+                self._enable_box_landing(False)
             self._publish_zero_velocity()
+
+        elif new_state == 'WAITING':
+            # All nodes should already be disabled
+            # Just sit and wait for REFLY service call
+            pass
 
         self.get_logger().info(f'STATE CHANGE: {old_state} -> {new_state}')
 
     def _enable_autonomous_navigation(self, enable: bool):
         """Enable/disable autonomous navigation node."""
+        # Check if already in desired state
+        if self.autonomous_nav_enabled == enable:
+            self.get_logger().debug(
+                f'Autonomous navigation already {"enabled" if enable else "disabled"} - skipping')
+            return
+
         if not self.autonomous_nav_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Autonomous navigation service not available')
             return
@@ -176,12 +226,19 @@ class ModeManagerNode(Node):
         request = SetBool.Request()
         request.data = enable
         future = self.autonomous_nav_client.call_async(request)
+        self.autonomous_nav_enabled = enable
         future.add_done_callback(
             lambda f: self.get_logger().info(
                 f'Autonomous navigation {"enabled" if enable else "disabled"}'))
 
     def _enable_box_landing(self, enable: bool):
         """Enable/disable box landing node."""
+        # Check if already in desired state
+        if self.box_landing_enabled == enable:
+            self.get_logger().debug(
+                f'Box landing already {"enabled" if enable else "disabled"} - skipping')
+            return
+
         if not self.box_landing_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Box landing service not available')
             return
@@ -189,6 +246,7 @@ class ModeManagerNode(Node):
         request = SetBool.Request()
         request.data = enable
         future = self.box_landing_client.call_async(request)
+        self.box_landing_enabled = enable
         future.add_done_callback(
             lambda f: self.get_logger().info(
                 f'Box landing {"enabled" if enable else "disabled"}'))
@@ -278,7 +336,12 @@ class ModeManagerNode(Node):
                 stop_msg.data = True
                 self.emergency_stop_pub.publish(stop_msg)
 
-                self._change_state('IDLE')
+                self._change_state('WAITING')
+            return
+
+        elif self.state == 'WAITING':
+            # Waiting for REFLY service call
+            # Do nothing, just maintain current state
             return
 
     def status_loop(self):

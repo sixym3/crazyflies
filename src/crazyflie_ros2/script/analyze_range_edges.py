@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Analyze edges in Crazyflie /range/down logs with a rolling window z-score,
@@ -15,6 +14,7 @@ time_ns,time_iso,range_m,height_err_m,delta_m_per_s,zscore_delta,edge_flag
 """
 
 import argparse
+import glob
 import math
 import os
 from typing import Optional
@@ -99,11 +99,22 @@ def plot_zscore(x, z, z_thresh, title, save_path: Optional[str] = None, show: bo
         plt.show(block=False)
 
 
+def find_latest_range_log():
+    """Find the latest range_down_log_*.csv file in the current directory."""
+    pattern = "range_down_log_*.csv"
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    # Sort by filename (which includes timestamp) to get the latest
+    files.sort(reverse=True)
+    return files[0]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Detect edges in Crazyflie range log using rolling z-score, with optional plots.")
-    ap.add_argument("--csv", required=True, help="Path to log CSV (e.g., range_down_log_20251013_130613.csv)")
-    ap.add_argument("--window", type=int, default=50, help="Rolling window size in rows (default: 50)")
-    ap.add_argument("--z-thresh", type=float, default=3.0, help="Edge threshold on |z| (default: 3.0)")
+    ap.add_argument("--csv", default=None, help="Path to log CSV (default: auto-detect latest range_down_log_*.csv)")
+    ap.add_argument("--window", type=int, default=None, help="Rolling window size in rows (default: prompt if not specified)")
+    ap.add_argument("--z-thresh", type=float, default=None, help="Edge threshold on |z| (default: prompt if not specified)")
     ap.add_argument(
         "--z-col",
         default="delta_m_per_s",
@@ -127,11 +138,6 @@ def main():
         help="Use centered rolling window (default: trailing window)",
     )
     ap.add_argument(
-        "--plot",
-        action="store_true",
-        help="Show interactive plots (two separate figures).",
-    )
-    ap.add_argument(
         "--save-prefix",
         default=None,
         help="If set, save PNGs with this prefix (e.g., /mnt/data/range_edges).",
@@ -144,9 +150,35 @@ def main():
     )
     args = ap.parse_args()
 
-    in_path = args.csv
+    # Auto-detect CSV file if not specified
+    if args.csv is None:
+        in_path = find_latest_range_log()
+        if in_path is None:
+            raise SystemExit("No range_down_log_*.csv files found in current directory. Please specify --csv.")
+        print(f"Auto-detected latest log file: {in_path}")
+    else:
+        in_path = args.csv
+
     if not os.path.exists(in_path):
         raise SystemExit(f"Input file not found: {in_path}")
+
+    # Prompt for window if not specified
+    if args.window is None:
+        try:
+            window_input = input("Enter rolling window size in rows (default 50): ").strip()
+            args.window = int(window_input) if window_input else 50
+        except ValueError:
+            print("Invalid input, using default: 50")
+            args.window = 50
+
+    # Prompt for z-thresh if not specified
+    if args.z_thresh is None:
+        try:
+            z_input = input("Enter edge threshold on |z| (default 3.0): ").strip()
+            args.z_thresh = float(z_input) if z_input else 3.0
+        except ValueError:
+            print("Invalid input, using default: 3.0")
+            args.z_thresh = 3.0
 
     df = pd.read_csv(in_path)
 
@@ -217,7 +249,8 @@ def main():
                 print(preview_df.to_string(index=False))
 
     # --------- Plotting / Saving Figures ---------
-    do_plot = bool(args.plot)
+    # Always enable plotting
+    do_plot = True
     do_save = bool(args.save_prefix)
 
     if do_plot or do_save:

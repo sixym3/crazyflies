@@ -31,6 +31,7 @@ setup(
             'crazyflie_sim_node = crazyflie_ros2.crazyflie_sim_node:main',
             'crazyflie_sim_with_simple_mapper = crazyflie_ros2.crazyflie_sim_with_simple_mapper:main',
             'range_edge_detector_node = crazyflie_ros2.range_edge_detector_node:main',
+            'range_edge_detector_absolute_node = crazyflie_ros2.range_edge_detector_absolute_node:main',
             'range_monitor_node = crazyflie_ros2.range_monitor_node:main',
             'mode_manager_node = crazyflie_ros2.mode_manager_node:main',
             'box_landing_node = crazyflie_ros2.box_landing_node:main',

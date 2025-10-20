@@ -1,4 +1,3 @@
-#!/home/eric/crazyflies/.venv/bin/python3
 """
 A* Path Planning Node for Crazyflie
 
