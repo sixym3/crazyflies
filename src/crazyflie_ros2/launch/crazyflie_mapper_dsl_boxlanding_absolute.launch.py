@@ -169,7 +169,7 @@ def generate_launch_description():
 
         box_landing_node = Node(
             package='crazyflie_ros2',
-            executable='box_landing_node',
+            executable='box_landing_simple_node',
             name='box_landing_node',
             output='screen',
             arguments=['--ros-args', '--log-level', log_level],

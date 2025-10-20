@@ -35,6 +35,7 @@ setup(
             'range_monitor_node = crazyflie_ros2.range_monitor_node:main',
             'mode_manager_node = crazyflie_ros2.mode_manager_node:main',
             'box_landing_node = crazyflie_ros2.box_landing_node:main',
+            'box_landing_simple_node = crazyflie_ros2.box_landing_simple_node:main',
         ],
     },
 )
