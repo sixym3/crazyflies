@@ -62,16 +62,51 @@ class BoxLandingSimpleNode(Node):
         res.message = f'box_landing_simple_node {"enabled" if self.enabled else "disabled"}'
         self.get_logger().info(res.message)
         if self.enabled:
-            # Clear state
-            self.edge_points.clear()
+            # Preserve the last edge (triggering edge from mode manager)
+            # Clear all except the last edge point
+            if len(self.edge_points) > 0:
+                last_edge = self.edge_points[-1]
+                self.edge_points.clear()
+                self.edge_points.append(last_edge)
+                self.get_logger().info(
+                    f'Box landing enabled - using triggering edge at ({last_edge[0]:.3f}, {last_edge[1]:.3f})')
+            else:
+                self.edge_points.clear()
+                self.get_logger().info('Box landing enabled - no triggering edge found')
+
+            # Reset state
             self.travel_direction = None
             self.target_yaw = None
             self.phase_start_time = None
 
-            # Start waiting for first edge
-            self.phase = 'WAIT_FIRST_EDGE'
-            self._publish_status('waiting_first_edge')
-            self.get_logger().info('Box landing enabled - waiting for first edge detection')
+            # If we have a triggering edge, process it immediately
+            if len(self.edge_points) > 0:
+                # Calculate travel direction
+                self.travel_direction = self._calculate_travel_direction()
+                if self.travel_direction is None:
+                    self.get_logger().error('Cannot calculate travel direction - handing control to mode_manager')
+                    self._publish_status('completed')
+                    self.phase = 'STOP'
+                    self.enabled = False
+                    res.success = False
+                    res.message = 'Failed to calculate travel direction'
+                    return res
+
+                # Calculate target yaw to face travel direction
+                vx, vy = self.travel_direction
+                self.target_yaw = math.atan2(vy, vx)
+                self.get_logger().info(
+                    f'Target yaw calculated: {math.degrees(self.target_yaw):.1f} degrees')
+
+                # Start rotating immediately
+                self.phase = 'ROTATE'
+                self._publish_status('rotating')
+                self.get_logger().info('Starting ROTATE phase immediately with triggering edge')
+            else:
+                # No triggering edge, wait for first edge
+                self.phase = 'WAIT_FIRST_EDGE'
+                self._publish_status('waiting_first_edge')
+                self.get_logger().info('Waiting for first edge detection')
         else:
             self.phase = 'IDLE'
             self.cmd_pub.publish(Twist())
@@ -171,16 +206,23 @@ class BoxLandingSimpleNode(Node):
         return (vx_world, vy_world)
 
     def edge_cb(self, msg: Bool):
-        """Handle edge detection events."""
-        if not msg.data or not self.enabled or self.pose is None:
+        """Handle edge detection events - records edges even when disabled."""
+        if not msg.data or self.pose is None:
             return
 
         x = self.pose.pose.position.x
         y = self.pose.pose.position.y
 
-        # First edge detection
+        # Always record edge (even when disabled, so mode manager's triggering edge is captured)
+        self.edge_points.append((x, y))
+
+        # Log based on whether we're enabled
+        if not self.enabled:
+            self.get_logger().info(f'Edge recorded at ({x:.3f}, {y:.3f}) [node disabled]')
+            return
+
+        # First edge detection (when enabled and waiting)
         if self.phase == 'WAIT_FIRST_EDGE':
-            self.edge_points.append((x, y))
             self.get_logger().info(f'FIRST EDGE detected at ({x:.3f}, {y:.3f})')
 
             # Calculate travel direction
@@ -205,7 +247,7 @@ class BoxLandingSimpleNode(Node):
 
         # Second edge detection
         elif self.phase == 'WAIT_SECOND_EDGE':
-            self.edge_points.append((x, y))
+            # Edge already appended at line 217
             self.get_logger().info(f'SECOND EDGE detected at ({x:.3f}, {y:.3f})')
 
             # Calculate center between two edge points

@@ -106,7 +106,7 @@ def generate_launch_description():
 
         dstarlite_path_planning_node = Node(
             package='crazyflie_ros2',
-            executable='dstarlite_path_planning_node',
+            executable='dstarlite_path_planning_simple_node',
             name='dstarlite_path_planning_node',
             output='screen',
             arguments=['--ros-args', '--log-level', f'dstarlite_path_planning_node:={log_level}'],

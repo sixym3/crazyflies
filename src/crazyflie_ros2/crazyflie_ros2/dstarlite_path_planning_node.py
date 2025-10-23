@@ -58,10 +58,10 @@ class DStarLitePlanner:
         DStarNode(0, 1, 1),
         DStarNode(-1, 0, 1),
         DStarNode(0, -1, 1),
-        DStarNode(1, 1, math.sqrt(2)),
-        DStarNode(1, -1, math.sqrt(2)),
-        DStarNode(-1, 1, math.sqrt(2)),
-        DStarNode(-1, -1, math.sqrt(2))
+        DStarNode(1, 1, 1),
+        DStarNode(1, -1, 1),
+        DStarNode(-1, 1, 1),
+        DStarNode(-1, -1, 1)
     ]
 
     def __init__(self, width: int, height: int, logger):
