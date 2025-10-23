@@ -4,7 +4,7 @@ mission_manager_node:
     search_span_m: 0.6
     search_step_m: 0.15
     min_edge_points: 20
-    goal_tolerance: 0.1
+    goal_tolerance: 0.15
     edge_detection_delay: 5.0
 
 edge_detector_node:
@@ -27,4 +27,4 @@ range_monitor_node:
     expected_height_m: 0.35
     plot_update_hz: 20.0
     log_dir: '.'
-    enable_monitor: true
+    enable_monitor: false

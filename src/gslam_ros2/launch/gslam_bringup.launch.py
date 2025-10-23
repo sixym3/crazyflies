@@ -77,7 +77,7 @@ def generate_launch_description():
 
     enable_monitor_arg = DeclareLaunchArgument(
         'enable_monitor',
-        default_value='true',
+        default_value='false',
         description='Enable range monitor visualization'
     )
 
