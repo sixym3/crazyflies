@@ -4,7 +4,7 @@ mission_manager_node:
     search_span_m: 0.6
     search_step_m: 0.15
     min_edge_points: 20
-    goal_tolerance: 0.15
+    goal_tolerance: 0.2
     edge_detection_delay: 5.0
 
 edge_detector_node:
