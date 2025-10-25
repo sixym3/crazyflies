@@ -255,7 +255,10 @@ class DStarLitePlanner:
             self.U.sort(key=lambda x: x[1])
 
     def compute_path(self, start_grid: Tuple[int, int],
-                     goal_grid: Tuple[int, int]) -> List[Tuple[int, int]]:
+                     goal_grid: Tuple[int, int],
+                     min_waypoint_distance_world: float = 0.0,
+                     grid_resolution: float = 1.0,
+                     use_line_of_sight: bool = False) -> List[Tuple[int, int]]:
         """Compute path from start to goal."""
         with self.planning_lock:
             if self.cost_map is None:
@@ -274,18 +277,19 @@ class DStarLitePlanner:
             # Compute shortest path
             self.compute_shortest_path()
 
-            # Extract path
+            # Extract path from D* Lite
             if np.isinf(self.g[self.start.x, self.start.y]):
                 self.logger.warning("No path found - start is unreachable")
                 return []
 
-            path = []
+            # Build full D* Lite path (all grid cells)
+            full_path = []
             current = DStarNode(self.start.x, self.start.y)
             max_steps = self.x_max * self.y_max  # Prevent infinite loops
             steps = 0
 
             while not compare_coordinates(current, self.goal) and steps < max_steps:
-                path.append((current.x, current.y))
+                full_path.append((current.x, current.y))
 
                 # Find best successor
                 successors = self.succ(current)
@@ -304,14 +308,158 @@ class DStarLitePlanner:
                 current = best_succ
                 steps += 1
 
-            if compare_coordinates(current, self.goal):
-                path.append((self.goal.x, self.goal.y))
-                self.logger.debug(f"D* Lite path found with {len(path)} waypoints")
-            else:
+            if not compare_coordinates(current, self.goal):
                 self.logger.warning(f"Path computation stopped after {steps} steps")
+                self.current_path = []
+                return []
+
+            # Always add goal
+            full_path.append((self.goal.x, self.goal.y))
+
+            # Optimize path based on distance and line-of-sight
+            if min_waypoint_distance_world > 0 or use_line_of_sight:
+                path = self._optimize_path(
+                    full_path, min_waypoint_distance_world,
+                    grid_resolution, use_line_of_sight)
+                self.logger.debug(
+                    f"Path optimized: {len(full_path)} -> {len(path)} waypoints")
+            else:
+                path = full_path
+                self.logger.debug(f"D* Lite path found with {len(path)} waypoints")
 
             self.current_path = path
             return path
+
+    def _optimize_path(self, path: List[Tuple[int, int]],
+                      min_distance_world: float,
+                      grid_resolution: float,
+                      use_line_of_sight: bool) -> List[Tuple[int, int]]:
+        """
+        Optimize path by removing unnecessary waypoints.
+        Uses line-of-sight checking and minimum distance constraints.
+
+        Args:
+            path: Full path from D* Lite (list of grid coordinates)
+            min_distance_world: Minimum distance between waypoints in world units
+            grid_resolution: Grid resolution (meters per cell)
+            use_line_of_sight: Whether to use line-of-sight optimization
+
+        Returns:
+            Optimized path with fewer waypoints
+        """
+        if len(path) <= 2:
+            return path
+
+        optimized = [path[0]]  # Always include start
+        current_idx = 0
+
+        while current_idx < len(path) - 1:
+            # Try to skip ahead as far as possible
+            farthest_idx = current_idx + 1
+
+            if use_line_of_sight:
+                # Try to find the farthest point we can reach with line-of-sight
+                for test_idx in range(len(path) - 1, current_idx, -1):
+                    # Check distance requirement
+                    gx_curr, gy_curr = path[current_idx]
+                    gx_test, gy_test = path[test_idx]
+
+                    # Convert to world distance
+                    dist_world = math.hypot(
+                        (gx_test - gx_curr) * grid_resolution,
+                        (gy_test - gy_curr) * grid_resolution
+                    )
+
+                    # If we meet distance requirement and have line of sight, use this point
+                    if dist_world >= min_distance_world or test_idx == len(path) - 1:
+                        if self.line_of_sight_clear(path[current_idx], path[test_idx]):
+                            farthest_idx = test_idx
+                            break
+            else:
+                # Just use distance constraint
+                for test_idx in range(current_idx + 1, len(path)):
+                    gx_curr, gy_curr = path[current_idx]
+                    gx_test, gy_test = path[test_idx]
+
+                    # Convert to world distance
+                    dist_world = math.hypot(
+                        (gx_test - gx_curr) * grid_resolution,
+                        (gy_test - gy_curr) * grid_resolution
+                    )
+
+                    if dist_world >= min_distance_world:
+                        farthest_idx = test_idx
+                        break
+
+                # If we didn't find any point meeting distance, just take the next one
+                if farthest_idx == current_idx + 1 and len(path) > current_idx + 1:
+                    farthest_idx = current_idx + 1
+
+            # Add the farthest reachable point
+            if farthest_idx < len(path):
+                optimized.append(path[farthest_idx])
+                current_idx = farthest_idx
+            else:
+                break
+
+        # Ensure goal is included (should already be there, but double-check)
+        if optimized[-1] != path[-1]:
+            optimized.append(path[-1])
+
+        return optimized
+
+    def line_of_sight_clear(self, start_grid: Tuple[int, int],
+                            end_grid: Tuple[int, int],
+                            max_cost: float = 2.0) -> bool:
+        """
+        Check if there's a clear line of sight between two grid points.
+        Uses Bresenham's line algorithm to check all cells along the path.
+
+        Args:
+            start_grid: Starting grid coordinates (x, y)
+            end_grid: Ending grid coordinates (x, y)
+            max_cost: Maximum allowed cost for cells (default 2.0 for free/low-cost cells)
+
+        Returns:
+            True if path is clear (all cells <= max_cost), False otherwise
+        """
+        if self.cost_map is None:
+            return False
+
+        x0, y0 = start_grid
+        x1, y1 = end_grid
+
+        # Bresenham's line algorithm
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        x, y = x0, y0
+
+        while True:
+            # Check if current cell is valid and has acceptable cost
+            if not (0 <= x < self.x_max and 0 <= y < self.y_max):
+                return False
+
+            if self.cost_map[x, y] > max_cost:
+                return False
+
+            # Check if we've reached the end
+            if x == x1 and y == y1:
+                break
+
+            # Move to next cell
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+
+        return True
 
 
 class PlannerNode(Node):
@@ -322,10 +470,14 @@ class PlannerNode(Node):
 
         # Parameters
         self.declare_parameter('flight_height', 0.5)
-        self.declare_parameter('waypoint_skip_distance', 0.3)
+        self.declare_parameter('min_waypoint_distance', 0.3)
+        self.declare_parameter('use_line_of_sight_optimization', True)
+        self.declare_parameter('unknown_cell_cost', 50.0)
 
         self.flight_height = self.get_parameter('flight_height').value
-        self.waypoint_skip_distance = self.get_parameter('waypoint_skip_distance').value
+        self.min_waypoint_distance = self.get_parameter('min_waypoint_distance').value
+        self.use_line_of_sight_optimization = self.get_parameter('use_line_of_sight_optimization').value
+        self.unknown_cell_cost = self.get_parameter('unknown_cell_cost').value
 
         # State
         self.current_pose = None
@@ -426,7 +578,7 @@ class PlannerNode(Node):
         return response
 
     def _do_replanning(self) -> bool:
-        """Execute path planning."""
+        """Execute path planning with frontier-based exploration."""
         if not (self.planner and self.occupancy_grid_msg and
                 self.current_pose and self.goal_pose):
             self.get_logger().warning("Cannot plan: missing planner, map, pose, or goal")
@@ -456,49 +608,63 @@ class PlannerNode(Node):
                 self.get_logger().warning("Goal position out of bounds")
                 return False
 
-        # Compute path
-        path = self.planner.compute_path(start_grid, goal_grid)
+        # Check if goal is reachable (not in unknown or obstacle area)
+        cost_map = self.planner.cost_map
+        goal_is_reachable = (cost_map is not None and
+                            cost_map[goal_grid[0], goal_grid[1]] < self.unknown_cell_cost)
 
-        # Simplify and publish path
-        if path:
-            simplified_path = self._simplify_path(path)
+        planning_target = goal_grid
+        planning_to_frontier = False
+
+        if not goal_is_reachable:
+            # Goal is in unknown/high-cost area, find frontier toward goal
+            self.get_logger().info("Goal is in unknown area, searching for frontier...")
+
+            frontiers = self._find_frontiers(cost_map)
+            self.get_logger().info(f"Found {len(frontiers)} frontier cells")
+
+            if frontiers:
+                best_frontier = self._find_best_frontier_toward_goal(
+                    frontiers, start_world, goal_world)
+
+                if best_frontier:
+                    planning_target = best_frontier
+                    planning_to_frontier = True
+                    frontier_world = self._grid_to_world(*best_frontier)
+                    self.get_logger().info(
+                        f"Planning to frontier at ({frontier_world[0]:.2f}, {frontier_world[1]:.2f}) "
+                        f"toward goal ({goal_world[0]:.2f}, {goal_world[1]:.2f})")
+                else:
+                    self.get_logger().warning("No valid frontier found")
+                    return False
+            else:
+                self.get_logger().warning("No frontiers available, cannot explore further")
+                return False
+        else:
             self.get_logger().info(
-                f"Path simplified: {len(path)} -> {len(simplified_path)} waypoints")
-            self._publish_path(simplified_path)
+                f"Planning directly to goal at ({goal_world[0]:.2f}, {goal_world[1]:.2f})")
+
+        # Compute path to target (either goal or frontier)
+        path = self.planner.compute_path(
+            start_grid,
+            planning_target,
+            min_waypoint_distance_world=self.min_waypoint_distance,
+            grid_resolution=self.occupancy_grid_msg.info.resolution,
+            use_line_of_sight=self.use_line_of_sight_optimization
+        )
+
+        # Publish path
+        if path:
+            self.get_logger().info(f"Path generated with {len(path)} waypoints")
+            self._publish_path(path)
             return True
         else:
-            self.get_logger().warning("No path found")
+            if planning_to_frontier:
+                self.get_logger().warning("No path found to frontier")
+            else:
+                self.get_logger().warning("No path found to goal")
             return False
 
-    def _simplify_path(self, path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """
-        Simplify path by skipping waypoints that are too close together.
-        Always keeps first and last waypoint.
-        """
-        if len(path) <= 2:
-            return path
-
-        simplified = [path[0]]  # Always include start
-
-        for i in range(1, len(path) - 1):
-            gx_prev, gy_prev = simplified[-1]
-            gx_curr, gy_curr = path[i]
-
-            # Convert to world coordinates to check distance
-            wx_prev, wy_prev = self._grid_to_world(gx_prev, gy_prev)
-            wx_curr, wy_curr = self._grid_to_world(gx_curr, gy_curr)
-
-            dist = math.hypot(wx_curr - wx_prev, wy_curr - wy_prev)
-
-            # Only add waypoint if it's far enough from the last added one
-            if dist >= self.waypoint_skip_distance:
-                simplified.append(path[i])
-
-        # Always include goal
-        if not simplified or simplified[-1] != path[-1]:
-            simplified.append(path[-1])
-
-        return simplified
 
     def status_loop(self):
         """Periodic status logging."""
@@ -538,7 +704,7 @@ class PlannerNode(Node):
         cost_map = np.ones((width, height), dtype=np.float32)
 
         # Convert occupancy values to costs:
-        # -1 (unknown): slight penalty (2.0)
+        # -1 (unknown): high cost to discourage planning through unmapped areas
         # 0 (free): low cost (1.0)
         # 1-99 (weighted): scale to higher costs
         # >=100 (obstacle): infinite cost
@@ -548,7 +714,7 @@ class PlannerNode(Node):
                 val = grid_array[y, x]
 
                 if val < 0:  # Unknown
-                    cost_map[x, y] = 2.0
+                    cost_map[x, y] = self.unknown_cell_cost
                 elif val == 0:  # Free
                     cost_map[x, y] = 1.0
                 elif val < 100:  # Weighted/soft obstacle
@@ -558,6 +724,89 @@ class PlannerNode(Node):
                     cost_map[x, y] = np.inf
 
         return cost_map
+
+    def _find_frontiers(self, cost_map: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Find frontier cells in the cost map.
+        A frontier is a free cell (cost < 2.0) that is adjacent to an unknown cell.
+        """
+        if cost_map is None:
+            return []
+
+        width, height = cost_map.shape
+        frontiers = []
+
+        # 8-directional neighbors
+        neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+        for x in range(width):
+            for y in range(height):
+                # Check if current cell is free (low cost)
+                if cost_map[x, y] < 2.0:
+                    # Check if any neighbor is unknown
+                    has_unknown_neighbor = False
+                    for dx, dy in neighbors:
+                        nx, ny = x + dx, y + dy
+                        if 0 <= nx < width and 0 <= ny < height:
+                            # Check if neighbor is unknown (high cost from unknown cells)
+                            if cost_map[nx, ny] >= self.unknown_cell_cost:
+                                has_unknown_neighbor = True
+                                break
+
+                    if has_unknown_neighbor:
+                        frontiers.append((x, y))
+
+        return frontiers
+
+    def _find_best_frontier_toward_goal(self, frontiers: List[Tuple[int, int]],
+                                       start_world: Tuple[float, float],
+                                       goal_world: Tuple[float, float]) -> Optional[Tuple[int, int]]:
+        """
+        Find the best frontier that makes progress toward the goal.
+        Returns the frontier with the maximum projection onto the start-to-goal vector.
+        """
+        if not frontiers:
+            return None
+
+        start_x, start_y = start_world
+        goal_x, goal_y = goal_world
+
+        # Vector from start to goal
+        goal_vec_x = goal_x - start_x
+        goal_vec_y = goal_y - start_y
+        goal_vec_len = math.hypot(goal_vec_x, goal_vec_y)
+
+        if goal_vec_len < 0.001:
+            # Start and goal are the same, just return closest frontier
+            return min(frontiers, key=lambda f: math.hypot(
+                self._grid_to_world(f[0], f[1])[0] - start_x,
+                self._grid_to_world(f[0], f[1])[1] - start_y
+            ))
+
+        # Normalize goal vector
+        goal_vec_x /= goal_vec_len
+        goal_vec_y /= goal_vec_len
+
+        best_frontier = None
+        best_projection = -float('inf')
+
+        for frontier_grid in frontiers:
+            # Convert frontier to world coordinates
+            frontier_world = self._grid_to_world(frontier_grid[0], frontier_grid[1])
+            fx, fy = frontier_world
+
+            # Vector from start to frontier
+            frontier_vec_x = fx - start_x
+            frontier_vec_y = fy - start_y
+
+            # Project frontier vector onto goal vector
+            projection = frontier_vec_x * goal_vec_x + frontier_vec_y * goal_vec_y
+
+            if projection > best_projection:
+                best_projection = projection
+                best_frontier = frontier_grid
+
+        return best_frontier
 
     def _world_to_grid(self, x: float, y: float) -> Optional[Tuple[int, int]]:
         """Convert world coordinates to grid coordinates."""

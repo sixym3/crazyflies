@@ -54,6 +54,7 @@ class CrazyflieCommunicator(Node):
         self.declare_parameter('min_range', 0.02)   # meters
         self.declare_parameter('max_range', 3.5)    # meters
         self.declare_parameter('field_of_view', 0.436)  # ~25 deg
+        self.declare_parameter('range_sensor_offset', 0.15)  # meters
 
         self.height = self.get_parameter('height').value
         address = self.get_parameter('address').value
@@ -66,6 +67,7 @@ class CrazyflieCommunicator(Node):
         self.min_range = float(self.get_parameter('min_range').value)
         self.max_range = float(self.get_parameter('max_range').value)
         self.fov = float(self.get_parameter('field_of_view').value)
+        self.range_offset = float(self.get_parameter('range_sensor_offset').value)
 
         self.twist = Twist()
 
@@ -82,6 +84,10 @@ class CrazyflieCommunicator(Node):
         # Current odometry
         self.current_odom = None
         self.odom_lock = threading.Lock()
+
+        # Landing pose offset (for Kalman filter reset simulation)
+        self.landing_pose_offset = [0.0, 0.0, 0.0]  # x, y, yaw offset
+        self.offset_lock = threading.Lock()
 
         # State machine
         self.state = STATE_UNINITIALIZED  # Start in uninitialized state
@@ -101,6 +107,7 @@ class CrazyflieCommunicator(Node):
             'left':  self.create_publisher(Range, 'range/left', 10),
             'right': self.create_publisher(Range, 'range/right', 10),
             'up':    self.create_publisher(Range, 'range/up', 10),
+            'down':  self.create_publisher(Range, 'range/down', 10),
         }
         # TF broadcaster for odom -> base_link
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -125,9 +132,6 @@ class CrazyflieCommunicator(Node):
         # Create landing and takeoff services
         self.landing_srv = self.create_service(Trigger, 'land', self.land_srv_handler)
         self.takeoff_srv = self.create_service(Trigger, 'takeoff', self.takeoff_srv_handler)
-
-        # Create scan/rotation service
-        self.scan_srv = self.create_service(Trigger, 'scan_surround', self.scan_surround_handler)
 
         # Create Kalman filter reset service
         self.reset_kalman_srv = self.create_service(Trigger, 'reset_kalman', self.reset_kalman_srv_handler)
@@ -253,6 +257,19 @@ class CrazyflieCommunicator(Node):
         self.publish_state()  # Broadcast state change
         self.get_logger().info("Landing initiated...")
 
+        # Record current position and orientation before landing (for Kalman reset offset)
+        with self.odom_lock:
+            if self.current_odom is not None:
+                x = self.current_odom.pose.pose.position.x
+                y = self.current_odom.pose.pose.position.y
+                q = self.current_odom.pose.pose.orientation
+                yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
+                with self.offset_lock:
+                    self.landing_pose_offset = [x, y, yaw]
+                self.get_logger().info(f"Recorded landing pose offset: ({x:.3f}, {y:.3f}, {math.degrees(yaw):.1f}°)")
+            else:
+                self.get_logger().warn("No odometry available to record landing pose")
+
         # Gradual descent over 0.5 seconds (5 steps × 0.1s)
         for i in range(5):
             height = self.height - 0.1 * i
@@ -308,43 +325,6 @@ class CrazyflieCommunicator(Node):
         self.get_logger().info("Takeoff complete")
         response.success = True
         response.message = "Takeoff successful"
-        return response
-
-    def scan_surround_handler(self, request, response):
-        """Scan surroundings: rotate 90 degrees in place"""
-        with self.state_lock:
-            current_state = self.state
-
-        if current_state != STATE_FLYING:
-            response.success = False
-            response.message = f"Cannot scan: not in FLYING state (current state: {current_state})"
-            return response
-
-        self.get_logger().info("Scan surround: rotating 90 degrees...")
-
-        # Calculate rotation time: 90 degrees / angular_speed_factor (deg/s)
-        rotation_time = 90.0 / self.angular_speed_factor
-
-        # Send angular velocity command
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.linear.y = 0.0
-        twist.angular.z = math.radians(self.angular_speed_factor)  # Full rotation speed
-        self.cmd_vel_callback(twist)
-
-        # Wait for rotation to complete
-        time.sleep(rotation_time)
-
-        # Stop rotation
-        twist.angular.z = 0.0
-        self.cmd_vel_callback(twist)
-
-        # Small delay to stabilize
-        time.sleep(0.2)
-
-        self.get_logger().info("Scan complete")
-        response.success = True
-        response.message = "90 degree rotation complete"
         return response
 
     def reset_kalman_srv_handler(self, request, response):
@@ -569,6 +549,14 @@ class CrazyflieCommunicator(Node):
         roll = math.radians(float(data['stabilizer.roll']))
         pitch = math.radians(float(data['stabilizer.pitch']))
         yaw = math.radians(float(data['stabilizer.yaw']))
+
+        # Apply landing pose offset (simulates position/orientation continuity across Kalman resets)
+        with self.offset_lock:
+            x += self.landing_pose_offset[0]
+            y += self.landing_pose_offset[1]
+            yaw += self.landing_pose_offset[2]
+            # Z is NOT offset - height is actively controlled
+
         qx, qy, qz, qw = self._euler_to_quaternion(roll, pitch, yaw)
  
         # Odometry message
@@ -608,12 +596,14 @@ class CrazyflieCommunicator(Node):
             except Exception:
                 return float('inf')
  
+        # Apply offset to horizontal sensors (matches crazyflie_node.py calibration)
         ranges = {
-            'right': mm_to_m(data.get('range.right')),
-            'front': mm_to_m(data.get('range.front')),
-            'left':  mm_to_m(data.get('range.left')),
-            'back':  mm_to_m(data.get('range.back')),
-            'up':    mm_to_m(data.get('range.up')),
+            'right': mm_to_m(data.get('range.right')) + self.range_offset,
+            'front': mm_to_m(data.get('range.front')) + self.range_offset,
+            'left':  mm_to_m(data.get('range.left')) + self.range_offset,
+            'back':  mm_to_m(data.get('range.back')) + self.range_offset,
+            'up':    mm_to_m(data.get('range.up')),  # No offset for vertical sensor
+            'down':  mm_to_m(data.get('range.zrange')),  # Downward sensor (no offset)
         }
  
         # Publish Range messages

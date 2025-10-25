@@ -29,9 +29,11 @@ setup(
     entry_points={
         'console_scripts': [
             'controller = gslam_ros2.controller:main',
+            'sim_controller = gslam_ros2.sim_controller:main',
             'mapper_2d = gslam_ros2.mapper_2d_node:main',
             'planner_node = gslam_ros2.planner_node:main',
             'nav_node = gslam_ros2.nav_node:main',
+            'scan_node = gslam_ros2.scan_node:main',
             'mission_manager_node = gslam_ros2.mission_manager_node:main',
             'edge_detector_node = gslam_ros2.edge_detector_node:main',
             'range_monitor_node = gslam_ros2.range_monitor_node:main',

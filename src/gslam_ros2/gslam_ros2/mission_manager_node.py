@@ -38,7 +38,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, PointStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String, Int8
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
+from visualization_msgs.msg import Marker, MarkerArray
 import math
 
 
@@ -55,6 +56,8 @@ class MissionManagerNode(Node):
         self.declare_parameter('min_edge_points', 20)
         self.declare_parameter('goal_tolerance', 0.15)
         self.declare_parameter('edge_detection_delay', 5.0)
+        self.declare_parameter('box_center_policy', 'box_fitting')
+        self.declare_parameter('box_size', 0.3)
 
         self.flight_height = self.get_parameter('flight_height').value
         self.search_span = self.get_parameter('search_span_m').value
@@ -62,6 +65,8 @@ class MissionManagerNode(Node):
         self.min_edge_points = self.get_parameter('min_edge_points').value
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
         self.edge_delay = self.get_parameter('edge_detection_delay').value
+        self.box_center_policy = self.get_parameter('box_center_policy').value
+        self.box_size = self.get_parameter('box_size').value
 
         # State
         self.state = 'IDLE'
@@ -69,6 +74,8 @@ class MissionManagerNode(Node):
         self.current_pose = None
         self.goal_pose = None
         self.navigation_start_time = None
+        self.home_positioning_start = None  # Timer for precise home positioning
+        self.return_home_after_takeoff = False  # Flag for /refly service
 
         # Crazyflie controller state (0=FLYING, 1=LANDING, 2=LANDED, 3=TAKING_OFF)
         self.crazyflie_state = None
@@ -79,6 +86,7 @@ class MissionManagerNode(Node):
         self.grid_waypoints = []
         self.current_grid_idx = 0
         self.waiting_for_position = False
+        self.waypoint_reached_time = None  # Timer for stabilization between waypoints
         self.wait_complete_start = None
 
         # Subscribers
@@ -92,18 +100,30 @@ class MissionManagerNode(Node):
             Bool, '/position_target_reached', self.position_reached_callback, 10)
         self.crazyflie_state_sub = self.create_subscription(
             Int8, '/crazyflie/state', self.crazyflie_state_callback, 10)
+        self.nav_goal_reached_sub = self.create_subscription(
+            Bool, '/nav_node/goal_reached', self.nav_goal_reached_callback, 10)
 
         # Publishers
         self.state_pub = self.create_publisher(String, '/mode_manager/state', 10)
         self.cmd_pos_pub = self.create_publisher(PointStamped, '/cmd_pos', 10)
+        self.goal_pub = self.create_publisher(PoseStamped, '/goal_pose', 10)
+        self.edge_markers_pub = self.create_publisher(MarkerArray, '/perception/edge_points', 10)
 
         # Service clients
         self.takeoff_client = self.create_client(Trigger, '/takeoff')
         self.land_client = self.create_client(Trigger, '/land')
+        self.enable_nav_client = self.create_client(SetBool, '/enable_nav')
+        self.clear_map_client = self.create_client(Trigger, '/clear_map')
+
+        # Service servers
+        self.refly_srv = self.create_service(Trigger, '/refly', self.refly_srv_handler)
 
         # Timers
         self.control_timer = self.create_timer(0.1, self.control_loop)  # 10 Hz
         self.status_timer = self.create_timer(5.0, self.status_loop)
+
+        # Clear any stale markers from previous runs
+        self._clear_edge_markers()
 
         self.get_logger().info('Mission Manager Node initialized')
         self.get_logger().info(f'Initial state: {self.state}')
@@ -174,6 +194,9 @@ class MissionManagerNode(Node):
                 self.get_logger().info(
                     f'EDGE POINT #{len(self.edge_points)} recorded at ({x:.3f}, {y:.3f})')
 
+                # Publish visualization markers
+                self._publish_edge_markers()
+
                 # Check if we have enough points
                 if len(self.edge_points) >= self.min_edge_points:
                     self.get_logger().info(
@@ -184,7 +207,30 @@ class MissionManagerNode(Node):
         """Handle position target reached notifications from controller."""
         if msg.data and self.waiting_for_position:
             self.waiting_for_position = False
+            # Record time for waypoint stabilization delay
+            if self.box_landing_phase == 'GRID_SEARCH':
+                self.waypoint_reached_time = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().debug('Position target reached')
+
+    def nav_goal_reached_callback(self, msg: Bool):
+        """Handle nav_node goal reached notification."""
+        if msg.data and self.state == 'NAVIGATION':
+            if self.goal_pose is None:
+                return
+
+            # Check if current goal is at (0, 0)
+            goal_x = self.goal_pose.pose.position.x
+            goal_y = self.goal_pose.pose.position.y
+            tolerance = 0.1  # 10cm tolerance for considering goal at origin
+
+            if abs(goal_x) < tolerance and abs(goal_y) < tolerance:
+                # Reached origin - use precise positioning before landing
+                self.get_logger().info('Nav_node reached origin (0,0) → STATE CHANGE: NAVIGATION -> HOME_POSITIONING')
+                self._call_enable_nav(False)  # Disable nav_node
+                self._change_state('HOME_POSITIONING')
+            else:
+                # Reached goal - stay in navigation mode and wait
+                self.get_logger().info(f'Nav_node reached goal ({goal_x:.2f}, {goal_y:.2f}) - waiting in nav_mode for next command or edge detection')
 
     # ----- State Management -----
     def _change_state(self, new_state: str):
@@ -204,8 +250,16 @@ class MissionManagerNode(Node):
 
         elif new_state == 'NAVIGATION':
             self.navigation_start_time = self.get_clock().now().nanoseconds / 1e9
+            # Enable nav_node for autonomous navigation
+            self._call_enable_nav(True)
 
         elif new_state == 'BOX_LANDING':
+            # Disable nav_node - we're switching to direct position control for box landing
+            self._call_enable_nav(False)
+
+            # Clear markers from previous mission
+            self._clear_edge_markers()
+
             # Initialize box landing
             self.box_landing_phase = 'GRID_SEARCH'
             self.edge_points.clear()
@@ -221,8 +275,15 @@ class MissionManagerNode(Node):
 
                 self.grid_waypoints = self._generate_grid_waypoints(cx, cy)
                 self.current_grid_idx = 0
+                self.waypoint_reached_time = None  # Reset stabilization timer
                 self.get_logger().info(
                     f'Generated {len(self.grid_waypoints)} grid waypoints for search')
+
+        elif new_state == 'HOME_POSITIONING':
+            # Send precise position command to (0, 0) and start timer
+            self._send_position_target(0.0, 0.0, self.flight_height)
+            self.home_positioning_start = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info('Starting precise home positioning at (0, 0)')
 
         elif new_state == 'LAND':
             # Call land service
@@ -232,6 +293,7 @@ class MissionManagerNode(Node):
             # Reset mission state
             self.goal_pose = None
             self.navigation_start_time = None
+            self.home_positioning_start = None
 
         self.get_logger().info(f'STATE CHANGE: {old_state} -> {new_state}')
 
@@ -253,6 +315,19 @@ class MissionManagerNode(Node):
             if response.success:
                 self.get_logger().info(f'Takeoff successful: {response.message}')
                 self._change_state('READY')
+
+                # Check if we should auto-publish home goal (from /refly)
+                if self.return_home_after_takeoff:
+                    self.return_home_after_takeoff = False
+                    self.get_logger().info('Publishing return-to-home goal at (0, 0) after refly')
+                    home_goal = PoseStamped()
+                    home_goal.header.stamp = self.get_clock().now().to_msg()
+                    home_goal.header.frame_id = 'world'
+                    home_goal.pose.position.x = 0.0
+                    home_goal.pose.position.y = 0.0
+                    home_goal.pose.position.z = self.flight_height
+                    home_goal.pose.orientation.w = 1.0
+                    self.goal_pub.publish(home_goal)
             else:
                 self.get_logger().error(f'Takeoff failed: {response.message}')
                 self._change_state('IDLE')
@@ -282,6 +357,82 @@ class MissionManagerNode(Node):
                 self.get_logger().error(f'Landing failed: {response.message}')
         except Exception as e:
             self.get_logger().error(f'Land service call failed: {e}')
+
+    def refly_srv_handler(self, request, response):
+        """
+        Handle /refly service - takeoff and return to (0,0).
+        Should be called from WAITING state after landing.
+        """
+        if self.state != 'WAITING':
+            response.success = False
+            response.message = f'Cannot refly: not in WAITING state (current state: {self.state})'
+            self.get_logger().warn(response.message)
+            return response
+
+        self.get_logger().info('Refly requested - clearing map and initiating takeoff')
+
+        # Clear the map before reflying
+        self._call_clear_map()
+
+        # Transition to TAKEOFF state
+        self._change_state('TAKEOFF')
+
+        # After takeoff completes, the _takeoff_response_callback will transition to READY
+        # We need to modify that callback to check if we should auto-publish (0,0) goal
+        # Store a flag to indicate we should return home after takeoff
+        self.return_home_after_takeoff = True
+
+        response.success = True
+        response.message = 'Refly initiated - map cleared, will takeoff and return to (0,0)'
+        return response
+
+    def _call_enable_nav(self, enable: bool):
+        """Enable or disable nav_node navigation."""
+        if not self.enable_nav_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error('Enable nav service not available')
+            return
+
+        request = SetBool.Request()
+        request.data = enable
+        future = self.enable_nav_client.call_async(request)
+        future.add_done_callback(
+            lambda f: self._enable_nav_response_callback(f, enable))
+        action = "Enabling" if enable else "Disabling"
+        self.get_logger().info(f'{action} nav_node...')
+
+    def _enable_nav_response_callback(self, future, enable: bool):
+        """Handle enable nav service response."""
+        try:
+            response = future.result()
+            action = "enabled" if enable else "disabled"
+            if response.success:
+                self.get_logger().info(f'Nav_node {action}: {response.message}')
+            else:
+                self.get_logger().error(f'Nav_node {action} failed: {response.message}')
+        except Exception as e:
+            self.get_logger().error(f'Enable nav service call failed: {e}')
+
+    def _call_clear_map(self):
+        """Clear the occupancy grid map."""
+        if not self.clear_map_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error('Clear map service not available')
+            return
+
+        request = Trigger.Request()
+        future = self.clear_map_client.call_async(request)
+        future.add_done_callback(self._clear_map_response_callback)
+        self.get_logger().info('Calling clear map service...')
+
+    def _clear_map_response_callback(self, future):
+        """Handle clear map service response."""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'Map cleared: {response.message}')
+            else:
+                self.get_logger().error(f'Clear map failed: {response.message}')
+        except Exception as e:
+            self.get_logger().error(f'Clear map service call failed: {e}')
 
     # ----- Grid Search -----
     def _generate_grid_waypoints(self, center_x: float, center_y: float):
@@ -342,27 +493,193 @@ class MissionManagerNode(Node):
 
         return waypoints
 
+    def _compute_centroid(self, edge_points):
+        """Compute simple centroid (average) from edge points."""
+        xs = [p[0] for p in edge_points]
+        ys = [p[1] for p in edge_points]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        return (cx, cy)
+
+    def _fit_box_to_edges(self, edge_points):
+        """
+        Fit a square box of known size to edge points.
+
+        Uses least-squares optimization to find box center that best fits
+        the detected edge points, assuming box dimensions are known (0.3m x 0.3m).
+
+        Args:
+            edge_points: List of (x, y) tuples representing detected edges
+
+        Returns:
+            (cx, cy): Fitted box center coordinates
+        """
+        half_size = self.box_size / 2.0  # 0.15m
+
+        # Objective: minimize sum of squared distances from points to nearest box edge
+        def distance_to_box(center, point):
+            cx, cy = center
+            px, py = point
+            # Distance to nearest edge of box centered at (cx, cy)
+            dx = max(0, abs(px - cx) - half_size)
+            dy = max(0, abs(py - cy) - half_size)
+            return math.sqrt(dx**2 + dy**2)
+
+        # Start with centroid as initial guess
+        x0, y0 = self._compute_centroid(edge_points)
+
+        # Simple grid search for optimization (avoids scipy dependency)
+        best_center = (x0, y0)
+        best_error = sum(distance_to_box(best_center, p)**2 for p in edge_points)
+
+        # Grid search around initial guess
+        search_radius = 0.1  # Search within 10cm
+        search_step = 0.01   # 1cm resolution
+
+        for dx in range(-int(search_radius/search_step), int(search_radius/search_step)+1):
+            for dy in range(-int(search_radius/search_step), int(search_radius/search_step)+1):
+                cx = x0 + dx * search_step
+                cy = y0 + dy * search_step
+                error = sum(distance_to_box((cx, cy), p)**2 for p in edge_points)
+                if error < best_error:
+                    best_error = error
+                    best_center = (cx, cy)
+
+        return best_center
+
+    def _compute_box_center(self, edge_points):
+        """
+        Compute box center using selected policy.
+
+        Returns:
+            (cx, cy): Box center coordinates
+        """
+        if self.box_center_policy == 'box_fitting':
+            return self._fit_box_to_edges(edge_points)
+        elif self.box_center_policy == 'centroid':
+            return self._compute_centroid(edge_points)
+        else:
+            self.get_logger().warn(
+                f'Unknown policy: {self.box_center_policy}, defaulting to centroid')
+            return self._compute_centroid(edge_points)
+
     def _compute_and_navigate_to_centroid(self):
-        """Compute box centroid from edge points and navigate to it."""
+        """Compute box center from edge points and navigate to it."""
         if len(self.edge_points) < 3:
             self.get_logger().warn(
                 f'Not enough edge points: {len(self.edge_points)} < 3')
             return
 
-        # Compute centroid
-        xs = [p[0] for p in self.edge_points]
-        ys = [p[1] for p in self.edge_points]
-        cx = sum(xs) / len(xs)
-        cy = sum(ys) / len(ys)
+        # Use selected policy to compute box center
+        cx, cy = self._compute_box_center(self.edge_points)
         self.box_centroid = (cx, cy)
 
+        # Publish updated markers with center
+        self._publish_edge_markers()
+
         self.get_logger().info(
-            f'Box centroid computed: ({cx:.3f}, {cy:.3f}) from {len(self.edge_points)} edge points')
+            f'Box center ({self.box_center_policy}): ({cx:.3f}, {cy:.3f}) '
+            f'from {len(self.edge_points)} edge points')
 
         # Transition to navigate to centroid phase
         self.box_landing_phase = 'NAVIGATE_TO_CENTROID'
         self._send_position_target(cx, cy, self.flight_height)
         self.waiting_for_position = True
+
+    def _clear_edge_markers(self):
+        """Clear all edge point and box center markers from RViz."""
+        marker_array = MarkerArray()
+
+        # Delete all markers in edge_points namespace
+        edge_delete = Marker()
+        edge_delete.header.frame_id = 'world'
+        edge_delete.header.stamp = self.get_clock().now().to_msg()
+        edge_delete.ns = 'edge_points'
+        edge_delete.id = 0
+        edge_delete.action = Marker.DELETEALL
+        marker_array.markers.append(edge_delete)
+
+        # Delete all markers in box_center namespace
+        center_delete = Marker()
+        center_delete.header.frame_id = 'world'
+        center_delete.header.stamp = self.get_clock().now().to_msg()
+        center_delete.ns = 'box_center'
+        center_delete.id = 0
+        center_delete.action = Marker.DELETEALL
+        marker_array.markers.append(center_delete)
+
+        self.edge_markers_pub.publish(marker_array)
+        self.get_logger().debug('Cleared all edge point markers')
+
+    def _publish_edge_markers(self):
+        """Publish visualization markers for all detected edge points."""
+        marker_array = MarkerArray()
+
+        for i, (x, y) in enumerate(self.edge_points):
+            marker = Marker()
+            marker.header.frame_id = 'world'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'edge_points'
+            marker.id = i
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+
+            # Position
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.position.z = self.flight_height
+            marker.pose.orientation.w = 1.0
+
+            # Scale (small spheres)
+            marker.scale.x = 0.05
+            marker.scale.y = 0.05
+            marker.scale.z = 0.05
+
+            # Color (red for edge points)
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+
+            # Lifetime (persistent)
+            marker.lifetime.sec = 0
+            marker.lifetime.nanosec = 0
+
+            marker_array.markers.append(marker)
+
+        # Add marker for computed box center (if available)
+        if self.box_centroid is not None:
+            cx, cy = self.box_centroid
+            center_marker = Marker()
+            center_marker.header.frame_id = 'world'
+            center_marker.header.stamp = self.get_clock().now().to_msg()
+            center_marker.ns = 'box_center'
+            center_marker.id = 1000  # Unique ID
+            center_marker.type = Marker.CYLINDER
+            center_marker.action = Marker.ADD
+
+            center_marker.pose.position.x = cx
+            center_marker.pose.position.y = cy
+            center_marker.pose.position.z = self.flight_height
+            center_marker.pose.orientation.w = 1.0
+
+            # Scale (larger cylinder to show center)
+            center_marker.scale.x = 0.1
+            center_marker.scale.y = 0.1
+            center_marker.scale.z = 0.02
+
+            # Color (green for center)
+            center_marker.color.r = 0.0
+            center_marker.color.g = 1.0
+            center_marker.color.b = 0.0
+            center_marker.color.a = 0.8
+
+            center_marker.lifetime.sec = 0
+            center_marker.lifetime.nanosec = 0
+
+            marker_array.markers.append(center_marker)
+
+        self.edge_markers_pub.publish(marker_array)
 
     def _send_position_target(self, x: float, y: float, z: float):
         """Send position target to controller via cmd_pos."""
@@ -399,16 +716,9 @@ class MissionManagerNode(Node):
             return
 
         elif self.state == 'NAVIGATION':
-            # Need pose data for this state
-            if self.current_pose is None:
-                return
-            # Send goal position to controller
-            if self.goal_pose is not None and not self.waiting_for_position:
-                self._send_position_target(
-                    self.goal_pose.pose.position.x,
-                    self.goal_pose.pose.position.y,
-                    self.flight_height)
-                self.waiting_for_position = True
+            # Nav_node handles autonomous navigation - we just monitor for edge detection
+            # Edge detection will trigger transition to BOX_LANDING
+            # Goal reached will be handled by nav_goal_reached_callback
             return
 
         elif self.state == 'BOX_LANDING':
@@ -418,9 +728,17 @@ class MissionManagerNode(Node):
             if self.box_landing_phase == 'GRID_SEARCH':
                 # Send next grid waypoint
                 if not self.waiting_for_position and self.current_grid_idx < len(self.grid_waypoints):
+                    # Check if we need to wait for stabilization after reaching previous waypoint
+                    if self.waypoint_reached_time is not None:
+                        elapsed = self.get_clock().now().nanoseconds / 1e9 - self.waypoint_reached_time
+                        if elapsed < 0.5:
+                            return  # Still waiting for stabilization
+
+                    # Ready to send next waypoint
                     wx, wy = self.grid_waypoints[self.current_grid_idx]
                     self._send_position_target(wx, wy, self.flight_height)
                     self.waiting_for_position = True
+                    self.waypoint_reached_time = None  # Reset timer
                     self.current_grid_idx += 1
 
                 elif self.current_grid_idx >= len(self.grid_waypoints):
@@ -429,13 +747,9 @@ class MissionManagerNode(Node):
                         f'Grid search complete - {len(self.edge_points)} edges detected')
 
                     if len(self.edge_points) >= 3:
-                        if len(self.edge_points) >= self.min_edge_points:
-                            self.get_logger().info(
-                                f'Sufficient edges collected ({len(self.edge_points)} >= {self.min_edge_points})')
-                        else:
-                            self.get_logger().warn(
-                                f'Only {len(self.edge_points)} edges collected (target: {self.min_edge_points}), '
-                                f'attempting navigation with available points')
+                        self.get_logger().warn(
+                            f'{len(self.edge_points)} edges collected (target: {self.min_edge_points}), '
+                            f'attempting navigation with available points')
                         self._compute_and_navigate_to_centroid()
                     else:
                         self.get_logger().warn(
@@ -443,26 +757,28 @@ class MissionManagerNode(Node):
                         self._change_state('LAND')
 
             elif self.box_landing_phase == 'NAVIGATE_TO_CENTROID':
-                # Check if reached centroid
-                if not self.waiting_for_position and self.box_centroid is not None:
-                    cx, cy = self.box_centroid
-                    px = self.current_pose.pose.position.x
-                    py = self.current_pose.pose.position.y
-                    dist = math.hypot(cx - px, cy - py)
-
-                    if dist < self.goal_tolerance:
-                        self.get_logger().info(
-                            f'Reached box centroid! Distance={dist:.3f}m < {self.goal_tolerance}m')
-                        self.box_landing_phase = 'WAIT_COMPLETE'
-                        self.wait_complete_start = self.get_clock().now().nanoseconds / 1e9
+                # Check if reached centroid (trust controller's position_target_reached signal)
+                if not self.waiting_for_position:
+                    self.get_logger().info('Reached box centroid (controller confirmed arrival)')
+                    self.box_landing_phase = 'WAIT_COMPLETE'
+                    self.wait_complete_start = self.get_clock().now().nanoseconds / 1e9
 
             elif self.box_landing_phase == 'WAIT_COMPLETE':
-                # Wait 1 second before transitioning to land
+                # Wait 2 seconds to stabilize before transitioning to land
                 if self.wait_complete_start is not None:
                     elapsed = self.get_clock().now().nanoseconds / 1e9 - self.wait_complete_start
-                    if elapsed >= 1.0:
-                        self.get_logger().info('Box landing complete - initiating landing')
+                    if elapsed >= 2.0:
+                        self.get_logger().info('Box landing complete (stabilized for 2s) - initiating landing')
                         self._change_state('LAND')
+            return
+
+        elif self.state == 'HOME_POSITIONING':
+            # Precise positioning at (0, 0) before landing
+            if self.home_positioning_start is not None:
+                elapsed = self.get_clock().now().nanoseconds / 1e9 - self.home_positioning_start
+                if elapsed >= 0.2:  # Wait 0.2 seconds
+                    self.get_logger().info('Home positioning complete (0.2s elapsed) - initiating landing')
+                    self._change_state('LAND')
             return
 
         elif self.state == 'LAND':

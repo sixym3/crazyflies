@@ -29,7 +29,8 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PointStamped, PoseStamped
 from std_msgs.msg import Bool
-from std_srvs.srv import Trigger
+from std_srvs.srv import Trigger, SetBool
+from visualization_msgs.msg import Marker
 
 import math
 import threading
@@ -54,6 +55,7 @@ class NavNode(Node):
         self.current_odom = None
         self.goal_pose = None
         self.current_path = None
+        self.current_waypoint_index = 0
         self.position_reached = False
         self.goal_reached = False
 
@@ -71,12 +73,18 @@ class NavNode(Node):
         self.goal_sub = self.create_subscription(
             PoseStamped, '/goal_pose', self.goal_callback, 10)
 
-        # Publisher
+        # Publishers
         self.cmd_pos_pub = self.create_publisher(PointStamped, '/cmd_pos', 10)
+        self.waypoint_marker_pub = self.create_publisher(Marker, '/nav_waypoint_marker', 10)
+        self.goal_reached_pub = self.create_publisher(Bool, '/nav_node/goal_reached', 10)
 
         # Service clients
         self.replan_client = self.create_client(Trigger, '/trigger_replanning')
         self.scan_client = self.create_client(Trigger, '/scan_surround')
+
+        # Service servers
+        self.enable_service = self.create_service(
+            SetBool, '/enable_nav', self.enable_callback)
 
         # Navigation thread
         self.nav_thread = None
@@ -102,10 +110,13 @@ class NavNode(Node):
                 self.get_logger().debug('Position target reached')
 
     def path_callback(self, msg):
-        """Update current path."""
+        """Update current path and set waypoint index to 1 (skip first waypoint which is current position)."""
         with self.path_lock:
             self.current_path = msg
-            self.get_logger().debug(f'Received path with {len(msg.poses)} waypoints')
+            # Skip first waypoint (index 0, typically current position) and go to second waypoint
+            # Since replanning happens frequently, first waypoint is usually at/near current position
+            self.current_waypoint_index = 1 if len(msg.poses) > 1 else 0
+            self.get_logger().info(f'Received new path with {len(msg.poses)} waypoints, starting from index {self.current_waypoint_index}')
 
     def goal_callback(self, msg):
         """Handle new goal."""
@@ -116,6 +127,35 @@ class NavNode(Node):
         # Start navigation if not already running
         if self.enabled and not self.nav_running:
             self.start_navigation()
+
+    def enable_callback(self, request, response):
+        """Handle enable/disable service requests."""
+        if request.data:
+            # Enable navigation
+            self.enabled = True
+            if self.goal_pose is not None and not self.nav_running:
+                self.start_navigation()
+                response.success = True
+                response.message = 'Navigation enabled and started'
+                self.get_logger().info('Navigation enabled via service')
+            else:
+                response.success = True
+                response.message = 'Navigation enabled (waiting for goal or already running)'
+                self.get_logger().info('Navigation enabled via service')
+        else:
+            # Disable navigation
+            self.enabled = False
+            if self.nav_running:
+                self.stop_navigation()
+                response.success = True
+                response.message = 'Navigation disabled and stopped'
+                self.get_logger().info('Navigation disabled via service')
+            else:
+                response.success = True
+                response.message = 'Navigation disabled (was not running)'
+                self.get_logger().info('Navigation disabled via service')
+
+        return response
 
     def start_navigation(self):
         """Start the navigation loop in a separate thread."""
@@ -187,6 +227,11 @@ class NavNode(Node):
             if self.is_waypoint_goal(waypoint):
                 self.goal_reached = True
                 self.get_logger().info('Goal reached!')
+
+                # Publish goal reached notification
+                goal_reached_msg = Bool()
+                goal_reached_msg.data = True
+                self.goal_reached_pub.publish(goal_reached_msg)
                 break
 
         self.nav_running = False
@@ -228,8 +273,9 @@ class NavNode(Node):
 
     def select_waypoint_from_path(self) -> Optional[Tuple[float, float]]:
         """
-        Select next waypoint from path.
-        Returns furthest point within max_waypoint_distance.
+        Select next waypoint from path sequentially.
+        Starts from current_waypoint_index and returns the furthest waypoint
+        within max_waypoint_distance, ensuring path is followed sequentially.
         """
         with self.path_lock:
             if self.current_path is None or len(self.current_path.poses) == 0:
@@ -243,27 +289,55 @@ class NavNode(Node):
         current_x = self.current_odom.pose.pose.position.x
         current_y = self.current_odom.pose.pose.position.y
 
-        # Find furthest reachable waypoint
-        selected_waypoint = None
-        max_distance_found = 0.0
+        # Start from current waypoint index, but ensure it's within bounds
+        start_index = min(self.current_waypoint_index, len(path.poses) - 1)
 
-        for pose in path.poses:
+        # Safety check: if start_index was clamped, log warning
+        if start_index != self.current_waypoint_index:
+            self.get_logger().warning(
+                f'Waypoint index {self.current_waypoint_index} out of bounds (path length {len(path.poses)}), '
+                f'clamped to {start_index}')
+            self.current_waypoint_index = start_index
+
+        # Iterate through path from current index and find furthest reachable waypoint
+        selected_waypoint = None
+        selected_index = -1
+
+        for i in range(start_index, len(path.poses)):
+            pose = path.poses[i]
             wx = pose.pose.position.x
             wy = pose.pose.position.y
 
             distance = math.hypot(wx - current_x, wy - current_y)
 
             # Check if within max distance
-            if distance <= self.max_waypoint_distance and distance > max_distance_found:
+            if distance <= self.max_waypoint_distance:
+                # Update to this waypoint (we want the furthest one in sequence)
                 selected_waypoint = (wx, wy)
-                max_distance_found = distance
+                selected_index = i
+            else:
+                # Once we exceed max distance, stop searching
+                # (to maintain sequential path following)
+                break
 
-        # If no waypoint within max distance, use the closest one from the path
-        if selected_waypoint is None and len(path.poses) > 0:
-            # Just use the first waypoint
-            pose = path.poses[0]
+        # If no waypoint within max distance, use the waypoint at start_index anyway
+        # (we must make progress toward the path)
+        if selected_waypoint is None and start_index < len(path.poses):
+            pose = path.poses[start_index]
             selected_waypoint = (pose.pose.position.x, pose.pose.position.y)
-            self.get_logger().warning(f'No waypoint within max distance, using first: {selected_waypoint}')
+            selected_index = start_index
+            distance = math.hypot(selected_waypoint[0] - current_x,
+                                selected_waypoint[1] - current_y)
+            self.get_logger().warning(
+                f'Waypoint at index {start_index} exceeds max distance ({distance:.2f}m > {self.max_waypoint_distance}m), '
+                f'using it anyway to make progress')
+
+        if selected_waypoint:
+            # Update current waypoint index to the selected one
+            self.current_waypoint_index = selected_index
+            self.get_logger().debug(
+                f'Selected waypoint {selected_index + 1}/{len(path.poses)}: '
+                f'({selected_waypoint[0]:.2f}, {selected_waypoint[1]:.2f})')
 
         return selected_waypoint
 
@@ -282,6 +356,42 @@ class NavNode(Node):
 
         self.cmd_pos_pub.publish(msg)
         self.get_logger().debug(f'Published waypoint: ({waypoint[0]:.2f}, {waypoint[1]:.2f})')
+
+        # Publish marker for visualization
+        self.publish_waypoint_marker(waypoint)
+
+    def publish_waypoint_marker(self, waypoint: Tuple[float, float]):
+        """Publish marker for current target waypoint."""
+        marker = Marker()
+        marker.header.frame_id = 'odom'
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'nav_waypoint'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+
+        # Position
+        marker.pose.position.x = waypoint[0]
+        marker.pose.position.y = waypoint[1]
+        marker.pose.position.z = self.flight_height
+        marker.pose.orientation.w = 1.0
+
+        # Scale (size of sphere)
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+
+        # Color (blue for navigation waypoint)
+        marker.color.r = 0.0
+        marker.color.g = 0.5
+        marker.color.b = 1.0
+        marker.color.a = 0.8
+
+        # Lifetime (0 = forever)
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 0
+
+        self.waypoint_marker_pub.publish(marker)
 
     def wait_for_position_reached(self, timeout: float = 30.0) -> bool:
         """Wait for position_target_reached signal."""

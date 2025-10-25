@@ -14,6 +14,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import TransformStamped
+from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster
 
 import math
@@ -71,6 +72,10 @@ class Mapper2D(Node):
             )
         )
 
+        # Service to clear the map
+        self.clear_map_srv = self.create_service(
+            Trigger, '/clear_map', self.clear_map_callback)
+
         # Broadcast static transform from world to odom frame
         self.tf_broadcaster = StaticTransformBroadcaster(self)
         t_world_odom = TransformStamped()
@@ -108,6 +113,28 @@ class Mapper2D(Node):
         msg.data = self.map
         self.map_publisher.publish(msg)
         self.get_logger().debug("Published initial empty map")
+
+    def clear_map_callback(self, request, response):
+        """Reset the map to all unknown cells."""
+        map_size = self.map_width * self.map_height
+        self.map = [-1] * map_size
+
+        # Publish the cleared map
+        msg = OccupancyGrid()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'odom'
+        msg.info.resolution = self.map_resolution
+        msg.info.width = self.map_width
+        msg.info.height = self.map_height
+        msg.info.origin.position.x = self.map_origin_x
+        msg.info.origin.position.y = self.map_origin_y
+        msg.data = self.map
+        self.map_publisher.publish(msg)
+
+        self.get_logger().info('Map cleared - reset to all unknown cells')
+        response.success = True
+        response.message = 'Map cleared successfully'
+        return response
 
     def euler_from_quaternion(self, x, y, z, w):
         """Convert quaternion to euler angles (roll, pitch, yaw)."""
@@ -174,34 +201,47 @@ class Mapper2D(Node):
             return
 
         obstacle_count = 0
+        free_ray_count = 0
 
-        for i in range(len(data)):
-            point_x = int((data[i][0] - self.map_origin_x) / self.map_resolution)
-            point_y = int((data[i][1] - self.map_origin_y) / self.map_resolution)
+        for point, has_obstacle in data:
+            point_x = int((point[0] - self.map_origin_x) / self.map_resolution)
+            point_y = int((point[1] - self.map_origin_y) / self.map_resolution)
 
             # Check if point is within map bounds
             if not (0 <= point_x < self.map_width and 0 <= point_y < self.map_height):
                 self.get_logger().debug(f"Point ({point_x}, {point_y}) outside bounds, skipping")
                 continue
 
-            obstacle_count += 1
-
-            # Get cells along ray from robot to obstacle using Bresenham
+            # Get cells along ray from robot to point using Bresenham
             ray_cells = list(bresenham(position_x_map, position_y_map, point_x, point_y))
 
-            # Mark cells along ray as free space (except the last one)
-            for line_x, line_y in ray_cells[:-1]:
-                if 0 <= line_x < self.map_width and 0 <= line_y < self.map_height:
-                    map_idx = line_y * self.map_width + line_x
-                    # Only update if currently unknown
-                    if self.map[map_idx] == -1:
-                        self.map[map_idx] = 0
+            if has_obstacle:
+                # Obstacle detected: mark ray as free (except endpoint), endpoint as occupied
+                obstacle_count += 1
 
-            # Mark detected obstacle point as occupied
-            obstacle_idx = point_y * self.map_width + point_x
-            self.map[obstacle_idx] = 100
+                # Mark cells along ray as free space (except the last one)
+                for line_x, line_y in ray_cells[:-1]:
+                    if 0 <= line_x < self.map_width and 0 <= line_y < self.map_height:
+                        map_idx = line_y * self.map_width + line_x
+                        # Only update if currently unknown
+                        if self.map[map_idx] == -1:
+                            self.map[map_idx] = 0
 
-        self.get_logger().debug(f"Processed {obstacle_count} obstacles, updating map")
+                # Mark detected obstacle point as occupied
+                obstacle_idx = point_y * self.map_width + point_x
+                self.map[obstacle_idx] = 100
+            else:
+                # No obstacle: mark entire ray as free space (including endpoint)
+                free_ray_count += 1
+
+                for line_x, line_y in ray_cells:
+                    if 0 <= line_x < self.map_width and 0 <= line_y < self.map_height:
+                        map_idx = line_y * self.map_width + line_x
+                        # Only update if currently unknown
+                        if self.map[map_idx] == -1:
+                            self.map[map_idx] = 0
+
+        self.get_logger().debug(f"Processed {obstacle_count} obstacles and {free_ray_count} free rays, updating map")
 
         # Create and publish map message
         msg = OccupancyGrid()
@@ -219,7 +259,14 @@ class Mapper2D(Node):
         self.map_publisher.publish(msg)
 
     def rotate_and_create_points(self):
-        """Create 3D points from range data with rotation applied."""
+        """
+        Create 3D points from range data with rotation applied.
+
+        Returns:
+            list of tuples: [(point, has_obstacle), ...]
+                point: [x, y, z] - endpoint of ray
+                has_obstacle: bool - True if obstacle detected, False if free space only
+        """
         data = []
         o = self.position
         roll = self.angles[0]
@@ -239,22 +286,44 @@ class Mapper2D(Node):
         self.get_logger().debug(f"Ranges - back: {r_back:.2f}, right: {r_right:.2f}, "
                                 f"front: {r_front:.2f}, left: {r_left:.2f}, max: {self.range_max}")
 
-        # Process each valid range reading
-        if r_left < self.range_max and r_left != 0.0 and not math.isinf(r_left):
-            left = [o[0], o[1] + r_left, o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, left))
+        # Process each range reading
+        # Left sensor
+        if r_left != 0.0:
+            if r_left < self.range_max:
+                # Obstacle detected
+                left = [o[0], o[1] + r_left, o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, left), True))
+            else:
+                # No obstacle, mark free space to max_range
+                left = [o[0], o[1] + self.range_max, o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, left), False))
 
-        if r_right < self.range_max and r_right != 0.0 and not math.isinf(r_right):
-            right = [o[0], o[1] - r_right, o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, right))
+        # Right sensor
+        if r_right != 0.0:
+            if r_right < self.range_max:
+                right = [o[0], o[1] - r_right, o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, right), True))
+            else:
+                right = [o[0], o[1] - self.range_max, o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, right), False))
 
-        if r_front < self.range_max and r_front != 0.0 and not math.isinf(r_front):
-            front = [o[0] + r_front, o[1], o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, front))
+        # Front sensor
+        if r_front != 0.0:
+            if r_front < self.range_max:
+                front = [o[0] + r_front, o[1], o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, front), True))
+            else:
+                front = [o[0] + self.range_max, o[1], o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, front), False))
 
-        if r_back < self.range_max and r_back != 0.0 and not math.isinf(r_back):
-            back = [o[0] - r_back, o[1], o[2]]
-            data.append(self.rot(roll, pitch, yaw, o, back))
+        # Back sensor
+        if r_back != 0.0:
+            if r_back < self.range_max:
+                back = [o[0] - r_back, o[1], o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, back), True))
+            else:
+                back = [o[0] - self.range_max, o[1], o[2]]
+                data.append((self.rot(roll, pitch, yaw, o, back), False))
 
         return data
 

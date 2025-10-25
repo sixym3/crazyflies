@@ -10,7 +10,7 @@ def generate_launch_description():
     # Declare launch arguments
     height_arg = DeclareLaunchArgument(
         'height',
-        default_value='0.35',
+        default_value='0.70',
         description='Target flight height in meters'
     )
 
@@ -28,7 +28,7 @@ def generate_launch_description():
 
     angular_speed_factor_arg = DeclareLaunchArgument(
         'angular_speed_factor',
-        default_value='90.0',
+        default_value='45.0',
         description='Angular speed scaling factor (degrees/sec)'
     )
 
@@ -58,7 +58,7 @@ def generate_launch_description():
 
     max_waypoint_distance_arg = DeclareLaunchArgument(
         'max_waypoint_distance',
-        default_value='0.1',
+        default_value='0.4',
         description='Maximum distance to next waypoint (meters)'
     )
 
@@ -101,8 +101,20 @@ def generate_launch_description():
 
     edge_detection_delay_arg = DeclareLaunchArgument(
         'edge_detection_delay',
-        default_value='5.0',
+        default_value='15.0',
         description='Edge detection delay in seconds'
+    )
+
+    box_center_policy_arg = DeclareLaunchArgument(
+        'box_center_policy',
+        default_value='box_fitting',
+        description='Policy for computing box center (box_fitting or centroid)'
+    )
+
+    box_size_arg = DeclareLaunchArgument(
+        'box_size',
+        default_value='0.04',
+        description='Known box size in meters'
     )
 
     # Edge Detector parameters
@@ -167,6 +179,31 @@ def generate_launch_description():
         description='Plot update frequency in Hz'
     )
 
+    range_sensor_offset_arg = DeclareLaunchArgument(
+        'range_sensor_offset',
+        default_value='-0.2',
+        description='Range sensor mounting offset in meters'
+    )
+
+    # Planner parameters
+    unknown_cell_cost_arg = DeclareLaunchArgument(
+        'unknown_cell_cost',
+        default_value='50.0',
+        description='Cost for unknown cells in path planning'
+    )
+
+    min_waypoint_distance_arg = DeclareLaunchArgument(
+        'min_waypoint_distance',
+        default_value='0.3',
+        description='Minimum distance between waypoints in meters'
+    )
+
+    use_line_of_sight_optimization_arg = DeclareLaunchArgument(
+        'use_line_of_sight_optimization',
+        default_value='true',
+        description='Enable line-of-sight path optimization'
+    )
+
     # Controller node (now handles odometry and range publishing internally)
     controller_node = Node(
         package='gslam_ros2',
@@ -182,6 +219,7 @@ def generate_launch_description():
             'position_tolerance': LaunchConfiguration('position_tolerance'),
             'odom_frame': LaunchConfiguration('odom_frame'),
             'base_frame': LaunchConfiguration('base_frame'),
+            'range_sensor_offset': LaunchConfiguration('range_sensor_offset'),
         }]
     )
 
@@ -208,7 +246,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'flight_height': LaunchConfiguration('height'),
-            'waypoint_skip_distance': 0.3,
+            'min_waypoint_distance': LaunchConfiguration('min_waypoint_distance'),
+            'use_line_of_sight_optimization': LaunchConfiguration('use_line_of_sight_optimization'),
+            'unknown_cell_cost': LaunchConfiguration('unknown_cell_cost'),
         }]
     )
 
@@ -225,6 +265,19 @@ def generate_launch_description():
         }]
     )
 
+    # Scan node
+    scan_node = Node(
+        package='gslam_ros2',
+        executable='scan_node',
+        name='scan_node',
+        output='screen',
+        parameters=[{
+            'angular_speed': LaunchConfiguration('angular_speed_factor'),
+            'rotation_angle': 90.0,
+            'publish_rate': 50.0,
+        }]
+    )
+
     # Mission Manager node
     mission_manager_node = Node(
         package='gslam_ros2',
@@ -238,6 +291,8 @@ def generate_launch_description():
             'min_edge_points': LaunchConfiguration('min_edge_points'),
             'goal_tolerance': LaunchConfiguration('goal_tolerance'),
             'edge_detection_delay': LaunchConfiguration('edge_detection_delay'),
+            'box_center_policy': LaunchConfiguration('box_center_policy'),
+            'box_size': LaunchConfiguration('box_size'),
         }]
     )
 
@@ -295,6 +350,8 @@ def generate_launch_description():
         min_edge_points_arg,
         goal_tolerance_arg,
         edge_detection_delay_arg,
+        box_center_policy_arg,
+        box_size_arg,
         range_topic_arg,
         box_height_arg,
         modifier_arg,
@@ -305,10 +362,15 @@ def generate_launch_description():
         z_window_sec_arg,
         z_threshold_arg,
         plot_update_hz_arg,
+        range_sensor_offset_arg,
+        unknown_cell_cost_arg,
+        min_waypoint_distance_arg,
+        use_line_of_sight_optimization_arg,
         controller_node,
         mapper_2d_node,
         planner_node,
         nav_node,
+        scan_node,
         mission_manager_node,
         edge_detector_node,
         range_monitor_node,
